@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RWS Control Console</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="background-grid"></div>
+  <div class="royal-lines"></div>
+  <main class="dashboard">
+    <section class="panel camera-panel">
+      <header class="panel-header">
+        <h1>RWS Camera Feed</h1>
+        <p>Live optical channel with command-authenticated transport</p>
+      </header>
+      <div class="tv-frame">
+        <div class="scan-overlay"></div>
+        <img id="cameraFeed" src="/video_feed" alt="Camera Stream" />
+      </div>
+    </section>
+
+    <section class="panel control-panel">
+      <header class="panel-header">
+        <h2>Gimbal Joystick</h2>
+        <p>Drag to aim, or use keyboard: WASD / Arrow keys.</p>
+      </header>
+
+      <div class="auth-row">
+        <input id="apiKeyInput" class="api-key-input" type="password" placeholder="Optional API key" />
+        <button id="saveApiKeyBtn" class="btn secondary" type="button">Save Key</button>
+      </div>
+
+      <div class="joystick-wrap">
+        <div id="joystickBase" class="joystick-base" aria-label="2D Joystick">
+          <div id="joystickStick" class="joystick-stick"></div>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button id="centerBtn" class="btn secondary" type="button">Center</button>
+        <button id="fireBtn" class="btn danger" type="button">Fire</button>
+      </div>
+
+      <div class="actions">
+        <a href="/self-test" class="btn" style="text-decoration:none; text-align:center;">Run Startup Self-Test</a>
+        <div id="kbHint" class="kbd-hint">Keyboard step: 0.60 normalized units</div>
+      </div>
+
+      <div class="sensitivity-box">
+        <label for="kbSensitivity" class="sensitivity-label">Keyboard sensitivity</label>
+        <input id="kbSensitivity" type="range" min="0.15" max="1.00" step="0.05" value="0.60" />
+        <p id="kbSensitivityValue" class="sensitivity-value">0.60</p>
+      </div>
+
+      <div class="status-grid">
+        <article>
+          <h3>Connection</h3>
+          <p id="connStatus">Checking...</p>
+        </article>
+        <article>
+          <h3>Pan / Tilt</h3>
+          <p id="angleStatus">0 / 0</p>
+        </article>
+        <article>
+          <h3>Target</h3>
+          <p id="targetStatus">0 / 0</p>
+        </article>
+        <article>
+          <h3>Camera</h3>
+          <p id="cameraStatus">Initializing...</p>
+        </article>
+        <article>
+          <h3>Role</h3>
+          <p id="roleStatus">Unknown</p>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

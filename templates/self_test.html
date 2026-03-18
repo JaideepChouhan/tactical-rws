@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RWS Startup Self-Test</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="background-grid"></div>
+  <main class="dashboard single-column">
+    <section class="panel control-panel">
+      <header class="panel-header">
+        <h1>Startup Self-Test</h1>
+        <p>Automatic diagnostics for API access, camera readiness, and serial command path.</p>
+      </header>
+
+      <div class="status-grid one-col">
+        <article>
+          <h3>Auth</h3>
+          <p id="authStatus">Checking...</p>
+        </article>
+        <article>
+          <h3>Camera</h3>
+          <p id="cameraStatus">Checking...</p>
+        </article>
+        <article>
+          <h3>Serial</h3>
+          <p id="serialStatus">Checking...</p>
+        </article>
+        <article>
+          <h3>Movement Cycle</h3>
+          <p id="movementStatus">Checking...</p>
+        </article>
+        <article>
+          <h3>Overall</h3>
+          <p id="overallStatus">Running...</p>
+        </article>
+      </div>
+
+      <div class="actions">
+        <button id="runTestBtn" class="btn secondary" type="button">Run Again</button>
+        <a href="/" class="btn" style="text-align:center; text-decoration:none;">Open Control Console</a>
+      </div>
+
+      <pre id="rawOutput" class="raw-log"></pre>
+    </section>
+  </main>
+
+  <script src="/static/self_test.js"></script>
+</body>
+</html>

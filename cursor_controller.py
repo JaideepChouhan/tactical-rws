@@ -1,130 +1,192 @@
-import pyautogui
-import serial
-import time
+from __future__ import annotations
+
+import argparse
+import queue
 import threading
-from pynput import mouse  # Better for click detection
+import time
+from typing import Optional
 
-# --- Configuration ---
-SERIAL_PORT = '/dev/ttyUSB0'
-BAUDRATE = 9600
-SCREEN_WIDTH, SCREEN_HEIGHT = pyautogui.size()
-TRIGGER_HOME = 45
-TRIGGER_ACTIVE = 135
+from gun_controller import GunConfig, GunController, clamp
 
-# Disable pyautogui failsafe
-pyautogui.FAILSAFE = False
 
-# Smoothing factor (0-1, lower = smoother but more delay)
-SMOOTHING = 0.3
-# ---
-
-# Global variables for smoothing
-current_pan = 90
-current_tilt = 90
-target_pan = 90
-target_tilt = 90
-arduino = None
-
-def map_value(x, in_min, in_max, out_min, out_max):
-    """Maps a value from one range to another."""
+def map_value(x: float, in_min: float, in_max: float, out_min: float, out_max: float) -> float:
     if in_max == in_min:
         return out_min
     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
 
-def bound_mouse():
-    """Keep mouse within screen boundaries"""
-    x, y = pyautogui.position()
-    x = max(0, min(x, SCREEN_WIDTH - 1))
-    y = max(0, min(y, SCREEN_HEIGHT - 1))
-    if (x, y) != pyautogui.position():
-        pyautogui.moveTo(x, y)
-    return x, y
 
-def trigger_sequence():
-    """Move trigger from 45° → 135° → 45°"""
-    global arduino, current_pan, current_tilt
-    
-    # Send active position
-    data = f"{int(current_pan)},{int(current_tilt)},{TRIGGER_ACTIVE}\n"
-    arduino.write(data.encode())
-    print(f"🔥 Trigger: {TRIGGER_ACTIVE}°")
-    time.sleep(0.2)
-    
-    # Return to home
-    data = f"{int(current_pan)},{int(current_tilt)},{TRIGGER_HOME}\n"
-    arduino.write(data.encode())
-    print(f"⬅️ Trigger: {TRIGGER_HOME}°")
+def _import_mouse_dependencies():
+    try:
+        import pyautogui
+        from pynput import mouse
+        return pyautogui, mouse
+    except Exception as exc:
+        raise RuntimeError(
+            "Mouse mode requires pyautogui and pynput with desktop access. "
+            "Install dependencies and run in a graphical session."
+        ) from exc
 
-def on_click(x, y, button, pressed):
-    """Mouse click handler"""
-    if button == mouse.Button.right and pressed:
-        print("\n🔥 RIGHT CLICK DETECTED!")
-        threading.Thread(target=trigger_sequence, daemon=True).start()
-    return True
 
-def smooth_move():
-    """Smoothly move servos toward target"""
-    global current_pan, current_tilt, target_pan, target_tilt, arduino
-    
+def run_mouse_mode(controller: GunController):
+    pyautogui, mouse = _import_mouse_dependencies()
+
+    pyautogui.FAILSAFE = False
+
+    width, height = pyautogui.size()
+    if width <= 1 or height <= 1:
+        width, height = 1920, 1080
+
+    print(f"Mouse mode active. Screen: {width}x{height}")
+    print("Move mouse to aim. Right-click to fire. Ctrl+C to exit.")
+
+    def on_click(_x, _y, button, pressed):
+        if button == mouse.Button.right and pressed:
+            threading.Thread(target=controller.fire, daemon=True).start()
+
+    listener = mouse.Listener(on_click=on_click)
+    listener.start()
+
+    try:
+        while True:
+            x, y = pyautogui.position()
+            x = clamp(x, 0, width - 1)
+            y = clamp(y, 0, height - 1)
+
+            target_pan = map_value(x, 0, width, controller.config.pan_min, controller.config.pan_max)
+            target_tilt = map_value(y, 0, height, controller.config.tilt_max, controller.config.tilt_min)
+            controller.set_target_angles(target_pan, target_tilt)
+
+            state = controller.state()
+            print(
+                f"Target: {state['target_pan']:.1f}/{state['target_tilt']:.1f} | "
+                f"Current: {state['current_pan']:.1f}/{state['current_tilt']:.1f}",
+                end="\r",
+                flush=True,
+            )
+            time.sleep(0.04)
+    finally:
+        listener.stop()
+
+
+def run_terminal_mode(controller: GunController):
+    input_queue: queue.Queue[str] = queue.Queue()
+
+    def reader():
+        while True:
+            try:
+                line = input()
+            except EOFError:
+                input_queue.put("quit")
+                return
+            input_queue.put(line.strip())
+
+    threading.Thread(target=reader, daemon=True).start()
+
+    print("Terminal mode active.")
+    print("Commands: joy <x> <y> | set <pan> <tilt> | center | fire | status | help | quit")
+
     while True:
-        # Apply low-pass filter for smooth movement
-        current_pan = current_pan * (1 - SMOOTHING) + target_pan * SMOOTHING
-        current_tilt = current_tilt * (1 - SMOOTHING) + target_tilt * SMOOTHING
-        
-        # Send to Arduino
-        data = f"{int(current_pan)},{int(current_tilt)},{TRIGGER_HOME}\n"
-        arduino.write(data.encode())
-        
-        # Small delay for smoothness
-        time.sleep(0.02)
+        try:
+            cmd = input_queue.get(timeout=0.15)
+        except queue.Empty:
+            continue
+
+        if not cmd:
+            continue
+
+        parts = cmd.split()
+        op = parts[0].lower()
+
+        if op in {"quit", "exit", "q"}:
+            print("Exiting terminal mode.")
+            return
+
+        if op == "help":
+            print("joy <x> <y>: normalized joystick values in range -1..1")
+            print("set <pan> <tilt>: direct target angles")
+            print("center: move to center")
+            print("fire: execute trigger sequence")
+            print("status: show state")
+            print("quit: exit")
+            continue
+
+        if op == "center":
+            controller.center()
+            print("Centered.")
+            continue
+
+        if op == "fire":
+            threading.Thread(target=controller.fire, daemon=True).start()
+            print("Fire command issued.")
+            continue
+
+        if op == "status":
+            print(controller.state())
+            continue
+
+        if op == "joy":
+            if len(parts) != 3:
+                print("Usage: joy <x> <y>")
+                continue
+            try:
+                x = float(parts[1])
+                y = float(parts[2])
+                controller.set_from_joystick(x, y)
+                print(f"Joystick set: x={x:.2f} y={y:.2f}")
+            except ValueError:
+                print("Invalid values. Use numeric input.")
+            continue
+
+        if op == "set":
+            if len(parts) != 3:
+                print("Usage: set <pan> <tilt>")
+                continue
+            try:
+                pan = float(parts[1])
+                tilt = float(parts[2])
+                controller.set_target_angles(pan, tilt)
+                print(f"Target set: pan={pan:.1f} tilt={tilt:.1f}")
+            except ValueError:
+                print("Invalid values. Use numeric input.")
+            continue
+
+        print("Unknown command. Type help.")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Gun controller with mouse and terminal modes")
+    parser.add_argument("--mode", choices=["mouse", "terminal"], default="terminal")
+    parser.add_argument("--port", default=None, help="Serial port, example: /dev/ttyUSB0")
+    parser.add_argument("--baud", type=int, default=9600)
+    return parser.parse_args()
+
 
 def main():
-    global arduino, target_pan, target_tilt
-    
-    print(f"Screen: {SCREEN_WIDTH}x{SCREEN_HEIGHT}")
-    print("Connecting to Arduino...")
-    
+    args = parse_args()
+    config = GunConfig(serial_port=args.port, baudrate=args.baud)
+    controller = GunController(config)
+
+    controller.connect()
+    controller.start()
+
+    state = controller.state()
+    if state["connected"]:
+        print(f"Connected on {state['serial_port']}")
+    else:
+        print("Preview mode started (no serial connection).")
+        if state["last_error"]:
+            print(state["last_error"])
+
     try:
-        # Connect to Arduino
-        arduino = serial.Serial(port=SERIAL_PORT, baudrate=BAUDRATE, timeout=1)
-        time.sleep(2)
-        print("✅ Connected!")
-        print("• Move mouse to control pan/tilt (smoothed)")
-        print("• Right-click to fire trigger")
-        print("• Mouse automatically bounded to screen")
-        print("Press Ctrl+C to exit\n")
-        
-        # Start mouse listener in background
-        listener = mouse.Listener(on_click=on_click)
-        listener.start()
-        
-        # Start smooth movement thread
-        smooth_thread = threading.Thread(target=smooth_move, daemon=True)
-        smooth_thread.start()
-        
-        # Main loop - just update targets
-        while True:
-            # Get and bound mouse position
-            x, y = bound_mouse()
-            
-            # Update target positions
-            target_pan = map_value(x, 0, SCREEN_WIDTH, 0, 180)
-            target_tilt = map_value(y, 0, SCREEN_HEIGHT, 110, 70)
-            
-            # Display status occasionally
-            print(f"Target: Pan={int(target_pan):3d}° Tilt={int(target_tilt):3d}° | Current: {int(current_pan):3d}° {int(current_tilt):3d}°", end='\r')
-            
-            time.sleep(0.05)
-            
+        if args.mode == "mouse":
+            run_mouse_mode(controller)
+        else:
+            run_terminal_mode(controller)
     except KeyboardInterrupt:
-        print("\n\n👋 Exiting...")
+        print("Interrupted by user.")
     finally:
-        if arduino and arduino.is_open:
-            # Return to center on exit
-            arduino.write("90,90,45\n".encode())
-            time.sleep(0.3)
-            arduino.close()
-            print("Serial connection closed.")
+        controller.stop()
+
 
 if __name__ == "__main__":
     main()

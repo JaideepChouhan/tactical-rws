@@ -31,13 +31,13 @@ import signal
 
 # ──────────────────────────── Configuration ────────────────────────────
 
-SERIAL_PORT = '/dev/ttyUSB0'
+SERIAL_PORT = None
 BAUDRATE = 9600
 
 # Camera
 CAMERA_INDEX = 0
-CAMERA_WIDTH = 640
-CAMERA_HEIGHT = 480
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 720
 
 # Template (NCC patch) — size in pixels
 TEMPLATE_SIZE = 128          # square patch side length
@@ -89,6 +89,23 @@ def list_serial_ports():
 
 def connect_arduino(port, baud):
     """Open serial connection to Arduino with retry."""
+    if port is None:
+        available = [
+            p for p in list_serial_ports()
+            if any(token in p for token in ('ttyUSB', 'ttyACM', 'usbmodem', 'usbserial', 'cu.usb', 'COM'))
+        ]
+        preferred = ['/dev/ttyUSB0', '/dev/ttyUSB1', '/dev/ttyACM0', '/dev/ttyACM1']
+        for candidate in preferred:
+            if candidate in available:
+                port = candidate
+                break
+        if port is None and available:
+            port = available[0]
+
+    if port is None:
+        print("[ERROR] No serial ports detected.")
+        return None
+
     try:
         ser = serial.Serial(port=port, baudrate=baud, timeout=1)
         time.sleep(2)  # wait for Arduino reset
@@ -370,7 +387,8 @@ def main():
     print("=" * 60)
 
     # ── Connect Arduino ──
-    print(f"\n[INFO] Attempting serial connection on {SERIAL_PORT} @ {BAUDRATE}...")
+    display_port = SERIAL_PORT if SERIAL_PORT is not None else "auto-detect"
+    print(f"\n[INFO] Attempting serial connection on {display_port} @ {BAUDRATE}...")
     arduino = connect_arduino(SERIAL_PORT, BAUDRATE)
     if arduino:
         print(f"[OK]   Connected to {SERIAL_PORT}")
@@ -388,9 +406,13 @@ def main():
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, 30)
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"[OK]   Camera opened at {actual_w}x{actual_h}")
+
+    cv2.namedWindow("Visual Stabilizer — NCC Gun Control", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Visual Stabilizer — NCC Gun Control", actual_w, actual_h)
 
     # ── Start serial sender thread ──
     sender = threading.Thread(target=serial_sender, daemon=True)

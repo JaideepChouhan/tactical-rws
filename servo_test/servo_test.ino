@@ -7,7 +7,7 @@ void setup()
 {
   sr1.attach(5);
   sr2.attach(6);
-  sr3.attach(7);
+  sr3.attach(9);
 }
 
 void loop()
