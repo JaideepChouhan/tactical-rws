@@ -7,12 +7,16 @@ const saveApiKeyBtn = document.getElementById("saveApiKeyBtn");
 const kbSensitivity = document.getElementById("kbSensitivity");
 const kbSensitivityValue = document.getElementById("kbSensitivityValue");
 const kbHint = document.getElementById("kbHint");
+const cameraFeed = document.getElementById("cameraFeed");
+const manualTargetReticle = document.getElementById("manualTargetReticle");
 
 const lockMode = document.getElementById("lockMode");
 const lockDeadzone = document.getElementById("lockDeadzone");
 const lockDeadzoneValue = document.getElementById("lockDeadzoneValue");
 const lockGain = document.getElementById("lockGain");
 const lockGainValue = document.getElementById("lockGainValue");
+const manualResponse = document.getElementById("manualResponse");
+const manualResponseValue = document.getElementById("manualResponseValue");
 const lockEnableBtn = document.getElementById("lockEnableBtn");
 const lockDisableBtn = document.getElementById("lockDisableBtn");
 
@@ -32,6 +36,12 @@ let lastSendAt = 0;
 const pressedKeys = new Set();
 let keyStep = 0.6;
 let currentRole = "unknown";
+let currentLockMode = "face";
+let manualTargetNorm = { x: 0.5, y: 0.5 };
+let manualDragPointerId = null;
+let lastManualTargetSentAt = 0;
+let manualTargetInFlight = false;
+let queuedManualTarget = null;
 
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 
@@ -114,9 +124,72 @@ function applyRolePermissions(role) {
   lockMode.disabled = observerMode;
   lockDeadzone.disabled = observerMode;
   lockGain.disabled = observerMode;
+  manualResponse.disabled = observerMode;
 
   joystickBase.style.opacity = observerMode ? "0.6" : "1";
   roleStatus.textContent = currentRole;
+  if (observerMode) {
+    manualTargetReticle.classList.remove("visible");
+  }
+}
+
+function updateManualReticlePosition() {
+  const frameWidth = Math.max(1, cameraFeed.clientWidth);
+  const frameHeight = Math.max(1, cameraFeed.clientHeight);
+  const left = cameraFeed.offsetLeft + manualTargetNorm.x * frameWidth;
+  const top = cameraFeed.offsetTop + manualTargetNorm.y * frameHeight;
+
+  manualTargetReticle.style.left = `${left}px`;
+  manualTargetReticle.style.top = `${top}px`;
+}
+
+function setManualReticleVisibility() {
+  const visible = currentLockMode === "manual" && currentRole !== "observer";
+  manualTargetReticle.classList.toggle("visible", visible);
+}
+
+function pointToManualTarget(event) {
+  const frameRect = cameraFeed.getBoundingClientRect();
+  const x = clamp((event.clientX - frameRect.left) / Math.max(frameRect.width, 1), 0, 1);
+  const y = clamp((event.clientY - frameRect.top) / Math.max(frameRect.height, 1), 0, 1);
+  return { x, y };
+}
+
+async function pushManualTarget(point, force = false) {
+  const now = performance.now();
+  if (!force && now - lastManualTargetSentAt < 70) {
+    return;
+  }
+  lastManualTargetSentAt = now;
+  manualTargetNorm = { x: point.x, y: point.y };
+  updateManualReticlePosition();
+
+  if (currentRole === "observer") {
+    return;
+  }
+
+  queuedManualTarget = { x: point.x, y: point.y };
+  if (manualTargetInFlight) {
+    return;
+  }
+
+  while (queuedManualTarget) {
+    const nextPoint = queuedManualTarget;
+    queuedManualTarget = null;
+    manualTargetInFlight = true;
+    try {
+      await requestJSON("/api/target-lock/manual-target", {
+        method: "POST",
+        payload: { x: nextPoint.x, y: nextPoint.y },
+        retries: 1,
+      });
+    } catch (err) {
+      connStatus.textContent = "Manual target update failed";
+      break;
+    } finally {
+      manualTargetInFlight = false;
+    }
+  }
 }
 
 function moveStick(xNorm, yNorm) {
@@ -311,6 +384,17 @@ lockGain.addEventListener("input", () => {
   lockGainValue.textContent = Number(lockGain.value).toFixed(1);
 });
 
+manualResponse.addEventListener("input", () => {
+  manualResponseValue.textContent = Number(manualResponse.value).toFixed(2);
+});
+
+manualResponse.addEventListener("change", async () => {
+  if (currentRole === "observer") {
+    return;
+  }
+  await pushTargetLockConfig({ manual_response: parseFloat(manualResponse.value) });
+});
+
 async function pushTargetLockConfig(partial) {
   if (currentRole === "observer") {
     return;
@@ -322,9 +406,14 @@ async function pushTargetLockConfig(partial) {
       retries: 1,
     });
 
+    currentLockMode = data.mode || currentLockMode;
     lockModeStatus.textContent = (data.mode || "face").toUpperCase();
     lockStateStatus.textContent = data.enabled ? (data.locked ? "Locked" : "Searching") : "Disabled";
     lockConfidenceStatus.textContent = (data.confidence || 0).toFixed(2);
+    if (typeof data.manual_response === "number") {
+      manualResponse.value = String(data.manual_response.toFixed(2));
+      manualResponseValue.textContent = data.manual_response.toFixed(2);
+    }
   } catch (err) {
     connStatus.textContent = "Target lock config failed";
   }
@@ -336,7 +425,9 @@ lockEnableBtn.addEventListener("click", async () => {
     mode: lockMode.value,
     deadzone: parseFloat(lockDeadzone.value),
     kp_pan: parseFloat(lockGain.value),
+    manual_response: parseFloat(manualResponse.value),
   });
+  setManualReticleVisibility();
 });
 
 lockDisableBtn.addEventListener("click", async () => {
@@ -354,6 +445,55 @@ lockDisableBtn.addEventListener("click", async () => {
 
 lockMode.addEventListener("change", async () => {
   await pushTargetLockConfig({ mode: lockMode.value });
+  currentLockMode = lockMode.value;
+  setManualReticleVisibility();
+  if (currentLockMode === "manual") {
+    pushManualTarget(manualTargetNorm, true);
+  }
+});
+
+manualTargetReticle.addEventListener("pointerdown", async (event) => {
+  if (currentRole === "observer" || currentLockMode !== "manual") {
+    return;
+  }
+  manualDragPointerId = event.pointerId;
+  manualTargetReticle.setPointerCapture(event.pointerId);
+  const point = pointToManualTarget(event);
+  pushManualTarget(point, true);
+});
+
+manualTargetReticle.addEventListener("pointermove", async (event) => {
+  if (event.pointerId !== manualDragPointerId) {
+    return;
+  }
+  const point = pointToManualTarget(event);
+  pushManualTarget(point, false);
+});
+
+manualTargetReticle.addEventListener("pointerup", async (event) => {
+  if (event.pointerId !== manualDragPointerId) {
+    return;
+  }
+  manualTargetReticle.releasePointerCapture(event.pointerId);
+  manualDragPointerId = null;
+  const point = pointToManualTarget(event);
+  pushManualTarget(point, true);
+});
+
+manualTargetReticle.addEventListener("pointercancel", (event) => {
+  if (event.pointerId !== manualDragPointerId) {
+    return;
+  }
+  manualTargetReticle.releasePointerCapture(event.pointerId);
+  manualDragPointerId = null;
+});
+
+cameraFeed.addEventListener("click", async (event) => {
+  if (currentRole === "observer" || currentLockMode !== "manual") {
+    return;
+  }
+  const point = pointToManualTarget(event);
+  pushManualTarget(point, true);
 });
 
 async function refreshState() {
@@ -378,7 +518,8 @@ async function refreshState() {
     const lock = state.target_lock || {};
     const lockEnabled = Boolean(lock.enabled);
     const lockLocked = Boolean(lock.locked);
-    lockModeStatus.textContent = (lock.mode || "face").toUpperCase();
+    currentLockMode = lock.mode || "face";
+    lockModeStatus.textContent = currentLockMode.toUpperCase();
     lockStateStatus.textContent = lockEnabled ? (lockLocked ? "Locked" : "Searching") : "Disabled";
     lockConfidenceStatus.textContent = Number(lock.confidence || 0).toFixed(2);
 
@@ -390,9 +531,23 @@ async function refreshState() {
       lockGain.value = String(lock.kp_pan.toFixed(1));
       lockGainValue.textContent = lock.kp_pan.toFixed(1);
     }
+    if (typeof lock.manual_response === "number") {
+      manualResponse.value = String(lock.manual_response.toFixed(2));
+      manualResponseValue.textContent = lock.manual_response.toFixed(2);
+    }
     if (lock.mode) {
       lockMode.value = lock.mode;
     }
+    if (Array.isArray(lock.manual_target_norm) && lock.manual_target_norm.length === 2) {
+      if (manualDragPointerId === null) {
+        manualTargetNorm = {
+          x: clamp(Number(lock.manual_target_norm[0] || 0.5), 0, 1),
+          y: clamp(Number(lock.manual_target_norm[1] || 0.5), 0, 1),
+        };
+        updateManualReticlePosition();
+      }
+    }
+    setManualReticleVisibility();
 
     applyRolePermissions(state.role || "operator");
   } catch (err) {
@@ -418,6 +573,9 @@ kbHint.textContent = `Keyboard step: ${keyStep.toFixed(2)} normalized units`;
 
 lockDeadzoneValue.textContent = Number(lockDeadzone.value).toFixed(2);
 lockGainValue.textContent = Number(lockGain.value).toFixed(1);
+manualResponseValue.textContent = Number(manualResponse.value).toFixed(2);
+updateManualReticlePosition();
+window.addEventListener("resize", updateManualReticlePosition);
 
 refreshState();
-setInterval(refreshState, 1000);
+setInterval(refreshState, 250);

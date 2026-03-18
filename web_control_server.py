@@ -52,6 +52,7 @@ ROLE_POLICIES: Dict[Tuple[str, str], Set[str]] = {
     ("POST", "/api/target-lock/config"): {"operator"},
     ("POST", "/api/target-lock/enable"): {"operator"},
     ("POST", "/api/target-lock/disable"): {"operator"},
+    ("POST", "/api/target-lock/manual-target"): {"operator"},
 }
 
 
@@ -196,16 +197,19 @@ class TargetLockManager:
         self._lock = threading.Lock()
 
         self.enabled = False
-        self.mode: Literal["face", "object"] = "face"
+        self.mode: Literal["face", "object", "manual"] = "face"
         self.deadzone = 0.06
         self.kp_pan = 2.3
         self.kp_tilt = 2.0
         self.max_step = 2.1
+        self.manual_response = 0.38
 
         self.locked = False
         self.confidence = 0.0
         self.target_center: Optional[Tuple[int, int]] = None
         self.target_bbox: Optional[Tuple[int, int, int, int]] = None
+        self.manual_target_norm: Tuple[float, float] = (0.5, 0.5)
+        self.manual_target_filtered: Tuple[float, float] = (0.5, 0.5)
         self.last_detection_ts: Optional[float] = None
         self.missed_frames = 0
 
@@ -229,11 +233,12 @@ class TargetLockManager:
         self,
         *,
         enabled: Optional[bool] = None,
-        mode: Optional[Literal["face", "object"]] = None,
+        mode: Optional[Literal["face", "object", "manual"]] = None,
         deadzone: Optional[float] = None,
         kp_pan: Optional[float] = None,
         kp_tilt: Optional[float] = None,
         max_step: Optional[float] = None,
+        manual_response: Optional[float] = None,
     ):
         with self._lock:
             if enabled is not None:
@@ -251,6 +256,30 @@ class TargetLockManager:
                 self.kp_tilt = float(max(0.1, min(kp_tilt, 10.0)))
             if max_step is not None:
                 self.max_step = float(max(0.2, min(max_step, 10.0)))
+            if manual_response is not None:
+                self.manual_response = float(max(0.05, min(manual_response, 1.0)))
+
+    def set_manual_target(self, x_norm: float, y_norm: float):
+        with self._lock:
+            self.manual_target_norm = (
+                float(max(0.0, min(1.0, x_norm))),
+                float(max(0.0, min(1.0, y_norm))),
+            )
+            if self.mode == "manual":
+                self.locked = self.enabled
+
+    @staticmethod
+    def _map_value(x: float, in_min: float, in_max: float, out_min: float, out_max: float) -> float:
+        if in_max == in_min:
+            return out_min
+        return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
+
+    def _manual_target_to_angles(self) -> Tuple[float, float]:
+        cfg = self.gun.config
+        mx, my = self.manual_target_filtered
+        target_pan = self._map_value(mx, 0.0, 1.0, cfg.pan_min, cfg.pan_max)
+        target_tilt = self._map_value(my, 0.0, 1.0, cfg.tilt_max, cfg.tilt_min)
+        return float(target_pan), float(target_tilt)
 
     def _detect_face(self, frame: np.ndarray) -> Optional[Tuple[int, int, int, int, float]]:
         if self.face_cascade.empty():
@@ -318,7 +347,20 @@ class TargetLockManager:
 
         return best
 
+    def _detect_manual(self, frame: np.ndarray) -> Tuple[int, int, int, int, float]:
+        h, w = frame.shape[:2]
+        mx, my = self.manual_target_norm
+        center_x = int(mx * (w - 1))
+        center_y = int(my * (h - 1))
+        box_w = max(20, int(w * 0.05))
+        box_h = max(20, int(h * 0.05))
+        x = int(max(0, min(w - box_w, center_x - box_w // 2)))
+        y = int(max(0, min(h - box_h, center_y - box_h // 2)))
+        return x, y, box_w, box_h, 1.0
+
     def _detect_target(self, frame: np.ndarray) -> Optional[Tuple[int, int, int, int, float]]:
+        if self.mode == "manual":
+            return self._detect_manual(frame)
         if self.mode == "face":
             return self._detect_face(frame)
         return self._detect_object(frame)
@@ -336,7 +378,35 @@ class TargetLockManager:
             center_y = h // 2
 
             with self._lock:
-                if detection is None:
+                if self.mode == "manual":
+                    fx, fy = self.manual_target_filtered
+                    tx, ty = self.manual_target_norm
+                    alpha = self.manual_response
+                    fx += (tx - fx) * alpha
+                    fy += (ty - fy) * alpha
+                    self.manual_target_filtered = (float(fx), float(fy))
+
+                    x, y, bw, bh, confidence = self._detect_manual(frame)
+                    target_x = x + bw // 2
+                    target_y = y + bh // 2
+                    self.target_bbox = (int(x), int(y), int(bw), int(bh))
+                    self.target_center = (int(target_x), int(target_y))
+                    self.confidence = float(confidence)
+                    self.last_detection_ts = time.time()
+
+                    if self.enabled:
+                        pan_target, tilt_target = self._manual_target_to_angles()
+                        self.gun.set_target_angles(pan_target, tilt_target)
+                        self.locked = True
+                    else:
+                        self.locked = False
+                    manual_handled = True
+                else:
+                    manual_handled = False
+
+                if manual_handled:
+                    pass
+                elif detection is None:
                     self.missed_frames += 1
                     if self.missed_frames > 6:
                         self.locked = False
@@ -346,8 +416,7 @@ class TargetLockManager:
                     should_continue = True
                 else:
                     should_continue = False
-
-                if not should_continue:
+                if not manual_handled and not should_continue:
                     self.missed_frames = 0
                     x, y, bw, bh, confidence = detection
                     target_x = x + bw // 2
@@ -378,6 +447,10 @@ class TargetLockManager:
                     else:
                         self.locked = False
 
+            if manual_handled:
+                time.sleep(0.02)
+                continue
+
             if detection is None:
                 time.sleep(0.03)
                 continue
@@ -399,11 +472,20 @@ class TargetLockManager:
                 "confidence": round(self.confidence, 3),
                 "target_center": center,
                 "target_bbox": bbox,
+                "manual_target_norm": [
+                    round(float(self.manual_target_norm[0]), 4),
+                    round(float(self.manual_target_norm[1]), 4),
+                ],
+                "manual_target_filtered": [
+                    round(float(self.manual_target_filtered[0]), 4),
+                    round(float(self.manual_target_filtered[1]), 4),
+                ],
                 "last_detection_ts": self.last_detection_ts,
                 "deadzone": self.deadzone,
                 "kp_pan": self.kp_pan,
                 "kp_tilt": self.kp_tilt,
                 "max_step": self.max_step,
+                "manual_response": self.manual_response,
             }
 
     def annotate_frame(self, frame: np.ndarray) -> np.ndarray:
@@ -419,11 +501,20 @@ class TargetLockManager:
             locked = self.locked
             confidence = self.confidence
             bbox = self.target_bbox
+            manual_target_norm = self.manual_target_norm
 
         if bbox is not None:
             x, y, bw, bh = bbox
             color = (22, 217, 245) if locked and enabled else (0, 145, 255)
             cv2.rectangle(overlay, (x, y), (x + bw, y + bh), color, 2)
+
+        if mode == "manual":
+            mx = int(manual_target_norm[0] * max(1, w - 1))
+            my = int(manual_target_norm[1] * max(1, h - 1))
+            cv2.circle(overlay, (mx, my), 18, (38, 220, 255), 2)
+            cv2.circle(overlay, (mx, my), 6, (38, 220, 255), 1)
+            cv2.line(overlay, (mx - 24, my), (mx + 24, my), (38, 220, 255), 1)
+            cv2.line(overlay, (mx, my - 24), (mx, my + 24), (38, 220, 255), 1)
 
         status = f"AI LOCK {'ON' if enabled else 'OFF'} | MODE {mode.upper()} | CONF {confidence:.2f}"
         status_color = (22, 217, 245) if enabled else (125, 125, 125)
@@ -451,11 +542,17 @@ class AngleCommand(BaseModel):
 
 class TargetLockConfigCommand(BaseModel):
     enabled: Optional[bool] = None
-    mode: Optional[Literal["face", "object"]] = None
+    mode: Optional[Literal["face", "object", "manual"]] = None
     deadzone: Optional[float] = Field(default=None, ge=0.01, le=0.35)
     kp_pan: Optional[float] = Field(default=None, ge=0.1, le=10.0)
     kp_tilt: Optional[float] = Field(default=None, ge=0.1, le=10.0)
     max_step: Optional[float] = Field(default=None, ge=0.2, le=10.0)
+    manual_response: Optional[float] = Field(default=None, ge=0.05, le=1.0)
+
+
+class ManualTargetCommand(BaseModel):
+    x: float = Field(..., ge=0.0, le=1.0)
+    y: float = Field(..., ge=0.0, le=1.0)
 
 
 controller = GunController(GunConfig())
@@ -663,7 +760,14 @@ def public_config():
             "operator_enabled": bool(OPERATOR_KEY),
             "observer_enabled": bool(OBSERVER_KEY),
         },
-        "target_lock_modes": ["face", "object"],
+        "target_lock_modes": ["face", "object", "manual"],
+        "target_lock_defaults": {
+            "deadzone": 0.06,
+            "kp_pan": 2.3,
+            "kp_tilt": 2.0,
+            "max_step": 2.1,
+            "manual_response": 0.38,
+        },
     }
 
 
@@ -787,6 +891,7 @@ def target_lock_config(command: TargetLockConfigCommand, request: Request):
         kp_pan=command.kp_pan,
         kp_tilt=command.kp_tilt,
         max_step=command.max_step,
+        manual_response=command.manual_response,
     )
     payload = target_lock.state()
     audit_logger.log_event(
@@ -800,7 +905,23 @@ def target_lock_config(command: TargetLockConfigCommand, request: Request):
             "kp_pan": command.kp_pan,
             "kp_tilt": command.kp_tilt,
             "max_step": command.max_step,
+            "manual_response": command.manual_response,
         },
+        result="ok",
+    )
+    return payload
+
+
+@api.post("/api/target-lock/manual-target")
+def target_lock_manual_target(command: ManualTargetCommand, request: Request):
+    _require_roles(request, {"operator"})
+    target_lock.set_manual_target(command.x, command.y)
+    payload = target_lock.state()
+    audit_logger.log_event(
+        role=_request_role(request),
+        client_ip=_client_ip(request),
+        command="target-lock-manual-target",
+        payload={"x": command.x, "y": command.y},
         result="ok",
     )
     return payload

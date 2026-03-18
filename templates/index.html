@@ -12,19 +12,20 @@
   <main class="dashboard">
     <section class="panel camera-panel">
       <header class="panel-header">
-        <h1>RWS Camera Feed</h1>
-        <p>Live optical channel with command-authenticated transport</p>
+        <h1>Tactical Optics Feed</h1>
+        <p>Live mission channel with authenticated command path</p>
       </header>
       <div class="tv-frame">
         <div class="scan-overlay"></div>
         <img id="cameraFeed" src="/video_feed" alt="Camera Stream" />
+        <div id="manualTargetReticle" class="manual-target-reticle" aria-label="Manual target reticle"></div>
       </div>
     </section>
 
     <section class="panel control-panel">
       <header class="panel-header">
-        <h2>Gimbal Joystick</h2>
-        <p>Drag to aim, or use keyboard: WASD / Arrow keys.</p>
+        <h2>Fire Control</h2>
+        <p>Drag joystick to slew, or use WASD and arrow keys.</p>
       </header>
 
       <div class="auth-row">
@@ -55,14 +56,15 @@
       </div>
 
       <div class="target-lock-box">
-        <h3>AI Target Lock</h3>
-        <p class="target-lock-subtitle">OpenCV assisted lock on faces or dominant centered object.</p>
+        <h3>Target Acquisition</h3>
+        <p class="target-lock-subtitle">Auto detect (face or object) or drag manual reticle for precision cueing.</p>
 
         <div class="target-lock-row">
           <label for="lockMode">Mode</label>
           <select id="lockMode" class="lock-select">
             <option value="face">Face</option>
             <option value="object">Centered object</option>
+            <option value="manual">Manual target locking</option>
           </select>
         </div>
 
@@ -76,6 +78,12 @@
           <label for="lockGain">Pan gain</label>
           <input id="lockGain" type="range" min="0.5" max="5.0" step="0.1" value="2.3" />
           <span id="lockGainValue">2.3</span>
+        </div>
+
+        <div class="target-lock-row">
+          <label for="manualResponse">Manual response</label>
+          <input id="manualResponse" type="range" min="0.05" max="1.00" step="0.05" value="0.38" />
+          <span id="manualResponseValue">0.38</span>
         </div>
 
         <div class="actions target-lock-actions">

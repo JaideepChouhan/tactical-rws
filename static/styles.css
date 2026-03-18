@@ -1,14 +1,14 @@
 :root {
-  --bg-ink: #06070b;
-  --bg-royal: #0d1224;
-  --bg-panel: rgba(9, 12, 22, 0.82);
-  --line-gold: rgba(209, 171, 96, 0.62);
-  --line-gold-soft: rgba(209, 171, 96, 0.28);
-  --line-steel: rgba(145, 164, 199, 0.3);
-  --text-main: #ede8db;
-  --text-muted: #b2a586;
+  --bg-ink: #070a07;
+  --bg-royal: #111a12;
+  --bg-panel: rgba(9, 16, 10, 0.86);
+  --line-gold: rgba(177, 215, 89, 0.72);
+  --line-gold-soft: rgba(177, 215, 89, 0.32);
+  --line-steel: rgba(129, 158, 104, 0.34);
+  --text-main: #dce9c9;
+  --text-muted: #90ab71;
   --alert: #ce5568;
-  --ok: #95b38c;
+  --ok: #8fd36f;
 }
 
 * {
@@ -19,12 +19,12 @@ body {
   margin: 0;
   min-height: 100vh;
   color: var(--text-main);
-  font-family: "Cormorant Garamond", "Georgia", serif;
-  letter-spacing: 0.02em;
+  font-family: "Share Tech Mono", "JetBrains Mono", "Consolas", monospace;
+  letter-spacing: 0.03em;
   background:
-    radial-gradient(1000px 600px at 5% 0%, rgba(17, 32, 70, 0.35), transparent 60%),
-    radial-gradient(800px 500px at 95% 10%, rgba(73, 52, 14, 0.22), transparent 70%),
-    linear-gradient(145deg, #05060a 0%, #090d19 52%, #030407 100%);
+    radial-gradient(1000px 600px at 8% 0%, rgba(51, 84, 42, 0.32), transparent 60%),
+    radial-gradient(820px 520px at 95% 8%, rgba(29, 58, 25, 0.24), transparent 70%),
+    linear-gradient(145deg, #050704 0%, #0a1309 52%, #030502 100%);
 }
 
 .background-grid {
@@ -45,8 +45,8 @@ body {
   background:
     repeating-linear-gradient(
       125deg,
-      rgba(209, 171, 96, 0.1) 0,
-      rgba(209, 171, 96, 0.1) 1px,
+      rgba(177, 215, 89, 0.12) 0,
+      rgba(177, 215, 89, 0.12) 1px,
       transparent 1px,
       transparent 18px
     );
@@ -77,7 +77,7 @@ body {
   box-shadow:
     0 0 0 1px rgba(255, 255, 255, 0.03) inset,
     0 12px 35px rgba(0, 0, 0, 0.45),
-    0 0 22px rgba(209, 171, 96, 0.06);
+    0 0 22px rgba(177, 215, 89, 0.1);
   overflow: hidden;
 }
 
@@ -101,9 +101,9 @@ body {
 .panel-header h1,
 .panel-header h2 {
   margin: 0;
-  color: #f0e7d0;
+  color: #dff7af;
   font-weight: 600;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.09em;
   text-transform: uppercase;
 }
 
@@ -116,7 +116,7 @@ body {
 .tv-frame {
   position: relative;
   border: 1px solid var(--line-gold);
-  border-radius: 4px;
+  border-radius: 2px;
   background: #000;
   padding: 0.55rem;
 }
@@ -144,7 +144,7 @@ body {
   aspect-ratio: 16 / 9;
   object-fit: cover;
   display: block;
-  border: 1px solid rgba(209, 171, 96, 0.28);
+  border: 1px solid rgba(177, 215, 89, 0.34);
 }
 
 .scan-overlay {
@@ -158,6 +158,50 @@ body {
     transparent 2px,
     transparent 8px
   );
+}
+
+.manual-target-reticle {
+  position: absolute;
+  width: 38px;
+  height: 38px;
+  border: 2px solid rgba(58, 220, 255, 0.92);
+  border-radius: 50%;
+  box-shadow: 0 0 14px rgba(58, 220, 255, 0.42);
+  pointer-events: none;
+  transform: translate(-50%, -50%);
+  left: 50%;
+  top: 50%;
+  opacity: 0;
+  transition: opacity 150ms ease;
+}
+
+.manual-target-reticle::before,
+.manual-target-reticle::after {
+  content: "";
+  position: absolute;
+  background: rgba(58, 220, 255, 0.92);
+}
+
+.manual-target-reticle::before {
+  width: 26px;
+  height: 1px;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+}
+
+.manual-target-reticle::after {
+  width: 1px;
+  height: 26px;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+}
+
+.manual-target-reticle.visible {
+  opacity: 1;
+  pointer-events: auto;
+  cursor: move;
 }
 
 .control-panel {
@@ -232,18 +276,19 @@ body {
 
 .btn {
   border: 1px solid var(--line-gold-soft);
-  border-radius: 3px;
+  border-radius: 2px;
   background: rgba(6, 8, 16, 0.85);
   color: var(--text-main);
   padding: 0.75rem 0.9rem;
-  font-size: 0.92rem;
-  letter-spacing: 0.06em;
+  font-size: 0.85rem;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
   cursor: pointer;
 }
 
 .btn.secondary {
   border-color: var(--line-gold);
+  box-shadow: 0 0 8px rgba(177, 215, 89, 0.16);
 }
 
 .btn.danger {
@@ -296,7 +341,7 @@ body {
 
 .target-lock-box {
   border: 1px solid var(--line-gold-soft);
-  border-radius: 3px;
+  border-radius: 2px;
   padding: 0.75rem;
   background: rgba(9, 11, 19, 0.86);
 }
