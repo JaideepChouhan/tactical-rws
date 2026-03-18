@@ -20,6 +20,13 @@
         <img id="cameraFeed" src="/video_feed" alt="Camera Stream" />
         <div id="manualTargetReticle" class="manual-target-reticle" aria-label="Manual target reticle"></div>
       </div>
+      <section class="tactical-terminal" aria-label="Tactical live telemetry">
+        <header>
+          <h3>Live Tactical Stream</h3>
+          <p id="tacticalClock">--:--:--</p>
+        </header>
+        <pre id="tacticalStream" class="tactical-stream">[BOOT] Linking telemetry...</pre>
+      </section>
     </section>
 
     <section class="panel control-panel">
@@ -78,6 +85,12 @@
           <label for="lockGain">Pan gain</label>
           <input id="lockGain" type="range" min="0.5" max="5.0" step="0.1" value="2.3" />
           <span id="lockGainValue">2.3</span>
+        </div>
+
+        <div class="target-lock-row">
+          <label for="autoResponse">Auto response</label>
+          <input id="autoResponse" type="range" min="0.05" max="1.00" step="0.05" value="0.42" />
+          <span id="autoResponseValue">0.42</span>
         </div>
 
         <div class="target-lock-row">

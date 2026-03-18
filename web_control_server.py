@@ -25,6 +25,8 @@ CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
 CAMERA_FPS = 30
 JPEG_QUALITY = 85
+DETECT_WIDTH = 480
+FACE_DETECT_INTERVAL = 2
 MAX_API_BODY_BYTES = int(os.getenv("RWS_MAX_API_BODY_BYTES", "32768"))
 IDEMPOTENCY_TTL_SECONDS = int(os.getenv("RWS_IDEMPOTENCY_TTL_SECONDS", "30"))
 FIRE_COOLDOWN_SECONDS = float(os.getenv("RWS_FIRE_COOLDOWN_SECONDS", "0.45"))
@@ -203,6 +205,7 @@ class TargetLockManager:
         self.kp_tilt = 2.0
         self.max_step = 2.1
         self.manual_response = 0.38
+        self.auto_response = 0.42
 
         self.locked = False
         self.confidence = 0.0
@@ -210,8 +213,11 @@ class TargetLockManager:
         self.target_bbox: Optional[Tuple[int, int, int, int]] = None
         self.manual_target_norm: Tuple[float, float] = (0.5, 0.5)
         self.manual_target_filtered: Tuple[float, float] = (0.5, 0.5)
+        self.auto_target_filtered: Tuple[float, float] = (0.5, 0.5)
         self.last_detection_ts: Optional[float] = None
         self.missed_frames = 0
+        self._frame_counter = 0
+        self._last_face_detection: Optional[Tuple[int, int, int, int, float]] = None
 
         cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
         self.face_cascade = cv2.CascadeClassifier(cascade_path)
@@ -239,6 +245,7 @@ class TargetLockManager:
         kp_tilt: Optional[float] = None,
         max_step: Optional[float] = None,
         manual_response: Optional[float] = None,
+        auto_response: Optional[float] = None,
     ):
         with self._lock:
             if enabled is not None:
@@ -258,6 +265,8 @@ class TargetLockManager:
                 self.max_step = float(max(0.2, min(max_step, 10.0)))
             if manual_response is not None:
                 self.manual_response = float(max(0.05, min(manual_response, 1.0)))
+            if auto_response is not None:
+                self.auto_response = float(max(0.05, min(auto_response, 1.0)))
 
     def set_manual_target(self, x_norm: float, y_norm: float):
         with self._lock:
@@ -281,15 +290,36 @@ class TargetLockManager:
         target_tilt = self._map_value(my, 0.0, 1.0, cfg.tilt_max, cfg.tilt_min)
         return float(target_pan), float(target_tilt)
 
+    def _norm_to_angles(self, nx: float, ny: float) -> Tuple[float, float]:
+        cfg = self.gun.config
+        target_pan = self._map_value(nx, 0.0, 1.0, cfg.pan_min, cfg.pan_max)
+        target_tilt = self._map_value(ny, 0.0, 1.0, cfg.tilt_max, cfg.tilt_min)
+        return float(target_pan), float(target_tilt)
+
     def _detect_face(self, frame: np.ndarray) -> Optional[Tuple[int, int, int, int, float]]:
         if self.face_cascade.empty():
             return None
+        h, w = frame.shape[:2]
+        scale = 1.0
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if w > DETECT_WIDTH:
+            scale = DETECT_WIDTH / float(w)
+            scaled_h = max(1, int(h * scale))
+            gray = cv2.resize(gray, (DETECT_WIDTH, scaled_h), interpolation=cv2.INTER_LINEAR)
+
+        self._frame_counter += 1
+        if (self._frame_counter % FACE_DETECT_INTERVAL) != 0 and self._last_face_detection is not None:
+            return self._last_face_detection
+
         faces = self.face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(32, 32))
         if len(faces) == 0:
+            self._last_face_detection = None
             return None
 
-        h, w = frame.shape[:2]
+        if scale != 1.0:
+            inv = 1.0 / scale
+            faces = [(int(x * inv), int(y * inv), int(fw * inv), int(fh * inv)) for (x, y, fw, fh) in faces]
+
         frame_center = (w // 2, h // 2)
         best = None
         best_score = -1.0
@@ -308,11 +338,19 @@ class TargetLockManager:
 
         x, y, fw, fh = best
         confidence = min(1.0, max(0.2, (fw * fh) / float(w * h * 0.2)))
-        return int(x), int(y), int(fw), int(fh), float(confidence)
+        self._last_face_detection = (int(x), int(y), int(fw), int(fh), float(confidence))
+        return self._last_face_detection
 
     def _detect_object(self, frame: np.ndarray) -> Optional[Tuple[int, int, int, int, float]]:
         h, w = frame.shape[:2]
-        fg = self.bg_subtractor.apply(frame)
+        scale = 1.0
+        proc = frame
+        if w > DETECT_WIDTH:
+            scale = DETECT_WIDTH / float(w)
+            scaled_h = max(1, int(h * scale))
+            proc = cv2.resize(frame, (DETECT_WIDTH, scaled_h), interpolation=cv2.INTER_LINEAR)
+
+        fg = self.bg_subtractor.apply(proc)
         _, mask = cv2.threshold(fg, 215, 255, cv2.THRESH_BINARY)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, np.ones((5, 5), np.uint8))
@@ -321,10 +359,11 @@ class TargetLockManager:
         if not contours:
             return None
 
-        frame_center = (w // 2, h // 2)
+        proc_h, proc_w = proc.shape[:2]
+        frame_center = (proc_w // 2, proc_h // 2)
         best = None
         best_score = -1.0
-        min_area = (w * h) * 0.002
+        min_area = (proc_w * proc_h) * 0.002
 
         for contour in contours:
             area = cv2.contourArea(contour)
@@ -342,8 +381,13 @@ class TargetLockManager:
                     int(y),
                     int(bw),
                     int(bh),
-                    float(min(1.0, area / float(w * h * 0.22))),
+                    float(min(1.0, area / float(proc_w * proc_h * 0.22))),
                 )
+
+        if best is not None and scale != 1.0:
+            x, y, bw, bh, conf = best
+            inv = 1.0 / scale
+            best = (int(x * inv), int(y * inv), int(bw * inv), int(bh * inv), float(conf))
 
         return best
 
@@ -427,22 +471,17 @@ class TargetLockManager:
                     self.last_detection_ts = time.time()
 
                     if self.enabled:
-                        err_x = (target_x - center_x) / max(1.0, w / 2.0)
-                        err_y = (target_y - center_y) / max(1.0, h / 2.0)
+                        nx = float(max(0.0, min(1.0, target_x / max(1.0, w - 1))))
+                        ny = float(max(0.0, min(1.0, target_y / max(1.0, h - 1))))
 
-                        if abs(err_x) < self.deadzone:
-                            err_x = 0.0
-                        if abs(err_y) < self.deadzone:
-                            err_y = 0.0
+                        fx, fy = self.auto_target_filtered
+                        alpha = self.auto_response
+                        fx += (nx - fx) * alpha
+                        fy += (ny - fy) * alpha
+                        self.auto_target_filtered = (float(fx), float(fy))
 
-                        pan_step = float(np.clip(err_x * self.kp_pan, -self.max_step, self.max_step))
-                        tilt_step = float(np.clip(-err_y * self.kp_tilt, -self.max_step, self.max_step))
-
-                        state = self.gun.state()
-                        self.gun.set_target_angles(
-                            state["target_pan"] + pan_step,
-                            state["target_tilt"] + tilt_step,
-                        )
+                        pan_target, tilt_target = self._norm_to_angles(float(fx), float(fy))
+                        self.gun.set_target_angles(pan_target, tilt_target)
                         self.locked = True
                     else:
                         self.locked = False
@@ -486,6 +525,7 @@ class TargetLockManager:
                 "kp_tilt": self.kp_tilt,
                 "max_step": self.max_step,
                 "manual_response": self.manual_response,
+                "auto_response": self.auto_response,
             }
 
     def annotate_frame(self, frame: np.ndarray) -> np.ndarray:
@@ -502,6 +542,7 @@ class TargetLockManager:
             confidence = self.confidence
             bbox = self.target_bbox
             manual_target_norm = self.manual_target_norm
+            target_center = self.target_center
 
         if bbox is not None:
             x, y, bw, bh = bbox
@@ -515,6 +556,14 @@ class TargetLockManager:
             cv2.circle(overlay, (mx, my), 6, (38, 220, 255), 1)
             cv2.line(overlay, (mx - 24, my), (mx + 24, my), (38, 220, 255), 1)
             cv2.line(overlay, (mx, my - 24), (mx, my + 24), (38, 220, 255), 1)
+
+        if target_center is not None and enabled:
+            tx, ty = int(target_center[0]), int(target_center[1])
+            point_color = (24, 247, 110) if locked else (0, 195, 255)
+            cv2.circle(overlay, (tx, ty), 14, point_color, 2)
+            cv2.circle(overlay, (tx, ty), 4, point_color, -1)
+            cv2.line(overlay, (tx - 18, ty), (tx + 18, ty), point_color, 1)
+            cv2.line(overlay, (tx, ty - 18), (tx, ty + 18), point_color, 1)
 
         status = f"AI LOCK {'ON' if enabled else 'OFF'} | MODE {mode.upper()} | CONF {confidence:.2f}"
         status_color = (22, 217, 245) if enabled else (125, 125, 125)
@@ -548,6 +597,7 @@ class TargetLockConfigCommand(BaseModel):
     kp_tilt: Optional[float] = Field(default=None, ge=0.1, le=10.0)
     max_step: Optional[float] = Field(default=None, ge=0.2, le=10.0)
     manual_response: Optional[float] = Field(default=None, ge=0.05, le=1.0)
+    auto_response: Optional[float] = Field(default=None, ge=0.05, le=1.0)
 
 
 class ManualTargetCommand(BaseModel):
@@ -767,6 +817,7 @@ def public_config():
             "kp_tilt": 2.0,
             "max_step": 2.1,
             "manual_response": 0.38,
+            "auto_response": 0.42,
         },
     }
 
@@ -892,6 +943,7 @@ def target_lock_config(command: TargetLockConfigCommand, request: Request):
         kp_tilt=command.kp_tilt,
         max_step=command.max_step,
         manual_response=command.manual_response,
+        auto_response=command.auto_response,
     )
     payload = target_lock.state()
     audit_logger.log_event(
@@ -906,6 +958,7 @@ def target_lock_config(command: TargetLockConfigCommand, request: Request):
             "kp_tilt": command.kp_tilt,
             "max_step": command.max_step,
             "manual_response": command.manual_response,
+            "auto_response": command.auto_response,
         },
         result="ok",
     )

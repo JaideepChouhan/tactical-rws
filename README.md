@@ -45,11 +45,15 @@ Three tracking modes are integrated directly into the server and web UI:
 
 - Face mode
   - Uses Haar cascade frontal-face detection.
+  - Uses downscaled-frame detection plus short-interval caching for faster response.
   - Picks the strongest candidate near frame center.
+  - Converts locked target point directly to absolute pan/tilt mapping.
 
 - Centered object mode
   - Uses foreground segmentation (MOG2) and contour scoring.
+  - Runs on a resized processing frame for lower latency.
   - Tracks the dominant moving object nearest the center.
+  - Converts locked target point directly to absolute pan/tilt mapping.
 
 - Manual target locking mode
   - Operator drags a reticle circle over the live camera frame.
@@ -59,13 +63,14 @@ Three tracking modes are integrated directly into the server and web UI:
 
 Servo correction behavior:
 
-- Computes normalized frame error for target center.
-- Applies configurable proportional pan/tilt correction.
-- Uses deadzone and max-step limits to reduce oscillation.
+- Auto modes now use detect-then-absolute-aim logic (manual-style mapping).
+- Manual mode uses draggable reticle absolute mapping.
+- Both paths use response filters to keep movement quick but smooth.
 
 Live stream overlay now shows:
 - center crosshair,
 - detected target bounding box,
+- gun-point marker on current lock,
 - lock mode and confidence status text.
 
 ### 2) Web UI Integration
@@ -74,13 +79,16 @@ Added operator controls to dashboard:
 
 - mode switch: Face / Centered object / Manual target locking,
 - lock enable/disable,
+- mode/enable buttons with immediate visual color state cues,
 - live deadzone tuning,
 - pan gain tuning,
+- auto response tuning,
 - manual response tuning,
 - lock telemetry cards (mode, state, confidence),
-- draggable reticle overlay visible in Manual mode.
+- draggable reticle overlay visible in Manual mode,
+- tactical terminal-style live text stream under camera window.
 
-### 4) Industry-Grade Responsiveness Plan (Executed)
+### 3) Industry-Grade Responsiveness Plan (Executed)
 
 The following upgrades were planned and implemented:
 
@@ -89,7 +97,11 @@ The following upgrades were planned and implemented:
   - This removes oscillation and improves point-to-point accuracy.
 
 - Real-time smoothness
+  - Face and object lock switched to absolute target-to-angle mapping after detection lock.
+  - Added fast detection path with frame resizing and short-interval face cache.
+  - Added gun-point marker rendering on locked targets.
   - Added manual response filter in backend loop (configurable).
+  - Added auto response filter for face/object modes (configurable).
   - Added non-blocking reticle drag updates so UI does not stall on network RTT.
   - Reduced dashboard state polling interval for near real-time telemetry refresh.
 
@@ -100,8 +112,10 @@ The following upgrades were planned and implemented:
 - Tactical UX
   - Shifted console styling to military HUD visual language.
   - Reticle and panel visuals optimized for operator clarity.
+  - Added active/inactive button color cues for fast state recognition.
+  - Added tactical text stream panel under camera feed.
 
-### 3) API Hardening and Request Handling Tricks
+### 4) API Hardening and Request Handling Tricks
 
 Added robust request-handling mechanisms:
 
@@ -222,15 +236,17 @@ python3 web_control_server.py
 1. Open main dashboard.
 2. Select lock mode (Face, Centered object, or Manual target locking).
 3. Adjust deadzone and pan gain sliders.
-4. If using Manual mode, drag the reticle in the camera window to your desired visual point.
-5. Tune Manual response: lower for smoother movement, higher for faster movement.
-6. Click Enable Lock.
-7. Observe lock state and confidence; tune gain/deadzone/manual response to minimize overshoot.
+4. Tune Auto response for Face/Object modes.
+5. If using Manual mode, drag the reticle in the camera window to your desired visual point.
+6. Tune Manual response: lower for smoother movement, higher for faster movement.
+7. Click Enable Lock.
+8. Observe lock state and confidence; tune gain/deadzone/response sliders to minimize overshoot.
 
 Recommended tuning baseline:
 
 - deadzone: 0.05 to 0.08
 - pan gain: 1.8 to 2.8
+- auto response: 0.30 to 0.55
 - manual response: 0.25 to 0.55
 
 ---
@@ -262,9 +278,12 @@ Ranges:
 - Verify /api/state includes target_lock block.
 - Verify target_lock.manual_target_norm updates while dragging reticle in Manual mode.
 - Verify target_lock.manual_target_filtered and manual_response in /api/state.
+- Verify target_lock.auto_response in /api/state.
+- Verify lock enable/disable and mode controls visibly change button/select styles.
+- Verify tactical stream panel updates with live telemetry lines.
 - Verify fire cooldown and idempotency behavior.
 - Verify /api/audit records target lock config events.
-- Verify video feed overlay shows lock status and bounding box.
+- Verify video feed overlay shows lock status, bounding box, and gun-point marker.
 
 ---
 

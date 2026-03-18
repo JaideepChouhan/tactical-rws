@@ -9,12 +9,16 @@ const kbSensitivityValue = document.getElementById("kbSensitivityValue");
 const kbHint = document.getElementById("kbHint");
 const cameraFeed = document.getElementById("cameraFeed");
 const manualTargetReticle = document.getElementById("manualTargetReticle");
+const tacticalStream = document.getElementById("tacticalStream");
+const tacticalClock = document.getElementById("tacticalClock");
 
 const lockMode = document.getElementById("lockMode");
 const lockDeadzone = document.getElementById("lockDeadzone");
 const lockDeadzoneValue = document.getElementById("lockDeadzoneValue");
 const lockGain = document.getElementById("lockGain");
 const lockGainValue = document.getElementById("lockGainValue");
+const autoResponse = document.getElementById("autoResponse");
+const autoResponseValue = document.getElementById("autoResponseValue");
 const manualResponse = document.getElementById("manualResponse");
 const manualResponseValue = document.getElementById("manualResponseValue");
 const lockEnableBtn = document.getElementById("lockEnableBtn");
@@ -42,6 +46,8 @@ let manualDragPointerId = null;
 let lastManualTargetSentAt = 0;
 let manualTargetInFlight = false;
 let queuedManualTarget = null;
+const tacticalLog = [];
+let lastTelemetryLogAt = 0;
 
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 
@@ -124,6 +130,7 @@ function applyRolePermissions(role) {
   lockMode.disabled = observerMode;
   lockDeadzone.disabled = observerMode;
   lockGain.disabled = observerMode;
+  autoResponse.disabled = observerMode;
   manualResponse.disabled = observerMode;
 
   joystickBase.style.opacity = observerMode ? "0.6" : "1";
@@ -131,6 +138,34 @@ function applyRolePermissions(role) {
   if (observerMode) {
     manualTargetReticle.classList.remove("visible");
   }
+}
+
+function updateButtonStates(lockEnabled) {
+  lockEnableBtn.classList.toggle("active-state", lockEnabled);
+  lockEnableBtn.classList.toggle("inactive-state", !lockEnabled);
+  lockDisableBtn.classList.toggle("active-state", !lockEnabled);
+  lockDisableBtn.classList.toggle("inactive-state", lockEnabled);
+  lockMode.classList.toggle("active-state", lockEnabled);
+}
+
+function appendTacticalLine(line) {
+  const now = new Date();
+  tacticalClock.textContent = now.toLocaleTimeString();
+  const stamped = `[${now.toLocaleTimeString()}] ${line}`;
+  tacticalLog.push(stamped);
+  if (tacticalLog.length > 14) {
+    tacticalLog.shift();
+  }
+  tacticalStream.textContent = tacticalLog.join("\n");
+  tacticalStream.scrollTop = tacticalStream.scrollHeight;
+}
+
+function pulseControl(element) {
+  if (!element) {
+    return;
+  }
+  element.classList.add("pressed-state");
+  setTimeout(() => element.classList.remove("pressed-state"), 140);
 }
 
 function updateManualReticlePosition() {
@@ -323,6 +358,7 @@ window.addEventListener("keyup", (event) => {
 });
 
 centerBtn.addEventListener("click", async () => {
+  pulseControl(centerBtn);
   if (currentRole === "observer") {
     connStatus.textContent = "Observer role cannot control hardware";
     return;
@@ -347,6 +383,7 @@ saveApiKeyBtn.addEventListener("click", () => {
 });
 
 fireBtn.addEventListener("click", async () => {
+  pulseControl(fireBtn);
   if (currentRole === "observer") {
     connStatus.textContent = "Observer role cannot control hardware";
     return;
@@ -384,6 +421,17 @@ lockGain.addEventListener("input", () => {
   lockGainValue.textContent = Number(lockGain.value).toFixed(1);
 });
 
+autoResponse.addEventListener("input", () => {
+  autoResponseValue.textContent = Number(autoResponse.value).toFixed(2);
+});
+
+autoResponse.addEventListener("change", async () => {
+  if (currentRole === "observer") {
+    return;
+  }
+  await pushTargetLockConfig({ auto_response: parseFloat(autoResponse.value) });
+});
+
 manualResponse.addEventListener("input", () => {
   manualResponseValue.textContent = Number(manualResponse.value).toFixed(2);
 });
@@ -410,27 +458,36 @@ async function pushTargetLockConfig(partial) {
     lockModeStatus.textContent = (data.mode || "face").toUpperCase();
     lockStateStatus.textContent = data.enabled ? (data.locked ? "Locked" : "Searching") : "Disabled";
     lockConfidenceStatus.textContent = (data.confidence || 0).toFixed(2);
+    if (typeof data.auto_response === "number") {
+      autoResponse.value = String(data.auto_response.toFixed(2));
+      autoResponseValue.textContent = data.auto_response.toFixed(2);
+    }
     if (typeof data.manual_response === "number") {
       manualResponse.value = String(data.manual_response.toFixed(2));
       manualResponseValue.textContent = data.manual_response.toFixed(2);
     }
+    updateButtonStates(Boolean(data.enabled));
+    appendTacticalLine(`LOCK CFG mode=${currentLockMode.toUpperCase()} enabled=${Boolean(data.enabled)}`);
   } catch (err) {
     connStatus.textContent = "Target lock config failed";
   }
 }
 
 lockEnableBtn.addEventListener("click", async () => {
+  pulseControl(lockEnableBtn);
   await pushTargetLockConfig({
     enabled: true,
     mode: lockMode.value,
     deadzone: parseFloat(lockDeadzone.value),
     kp_pan: parseFloat(lockGain.value),
+    auto_response: parseFloat(autoResponse.value),
     manual_response: parseFloat(manualResponse.value),
   });
   setManualReticleVisibility();
 });
 
 lockDisableBtn.addEventListener("click", async () => {
+  pulseControl(lockDisableBtn);
   try {
     const data = await requestJSON("/api/target-lock/disable", {
       method: "POST",
@@ -438,18 +495,22 @@ lockDisableBtn.addEventListener("click", async () => {
       retries: 1,
     });
     lockStateStatus.textContent = data.enabled ? "Searching" : "Disabled";
+    updateButtonStates(Boolean(data.enabled));
+    appendTacticalLine("LOCK DISABLED");
   } catch (err) {
     connStatus.textContent = "Failed to disable target lock";
   }
 });
 
 lockMode.addEventListener("change", async () => {
+  pulseControl(lockMode);
   await pushTargetLockConfig({ mode: lockMode.value });
   currentLockMode = lockMode.value;
   setManualReticleVisibility();
   if (currentLockMode === "manual") {
     pushManualTarget(manualTargetNorm, true);
   }
+  appendTacticalLine(`MODE -> ${currentLockMode.toUpperCase()}`);
 });
 
 manualTargetReticle.addEventListener("pointerdown", async (event) => {
@@ -531,6 +592,10 @@ async function refreshState() {
       lockGain.value = String(lock.kp_pan.toFixed(1));
       lockGainValue.textContent = lock.kp_pan.toFixed(1);
     }
+    if (typeof lock.auto_response === "number") {
+      autoResponse.value = String(lock.auto_response.toFixed(2));
+      autoResponseValue.textContent = lock.auto_response.toFixed(2);
+    }
     if (typeof lock.manual_response === "number") {
       manualResponse.value = String(lock.manual_response.toFixed(2));
       manualResponseValue.textContent = lock.manual_response.toFixed(2);
@@ -548,6 +613,14 @@ async function refreshState() {
       }
     }
     setManualReticleVisibility();
+    updateButtonStates(lockEnabled);
+    const now = performance.now();
+    if (now - lastTelemetryLogAt > 950) {
+      appendTacticalLine(
+        `TEL role=${state.role || "operator"} mode=${currentLockMode.toUpperCase()} lock=${lockLocked ? "LOCK" : "SCAN"} conf=${Number(lock.confidence || 0).toFixed(2)} pan=${state.current_pan.toFixed(1)} tilt=${state.current_tilt.toFixed(1)}`
+      );
+      lastTelemetryLogAt = now;
+    }
 
     applyRolePermissions(state.role || "operator");
   } catch (err) {
@@ -560,6 +633,7 @@ async function refreshState() {
     cameraStatus.textContent = "State unavailable";
     roleStatus.textContent = "Unknown";
     lockStateStatus.textContent = "Unavailable";
+    appendTacticalLine("WARN telemetry unavailable");
   }
 }
 
@@ -573,9 +647,11 @@ kbHint.textContent = `Keyboard step: ${keyStep.toFixed(2)} normalized units`;
 
 lockDeadzoneValue.textContent = Number(lockDeadzone.value).toFixed(2);
 lockGainValue.textContent = Number(lockGain.value).toFixed(1);
+autoResponseValue.textContent = Number(autoResponse.value).toFixed(2);
 manualResponseValue.textContent = Number(manualResponse.value).toFixed(2);
 updateManualReticlePosition();
 window.addEventListener("resize", updateManualReticlePosition);
+appendTacticalLine("BOOT command channel online");
 
 refreshState();
 setInterval(refreshState, 250);

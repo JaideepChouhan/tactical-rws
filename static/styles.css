@@ -204,6 +204,53 @@ body {
   cursor: move;
 }
 
+.tactical-terminal {
+  margin-top: 0.75rem;
+  border: 1px solid var(--line-gold-soft);
+  border-radius: 2px;
+  background: rgba(5, 11, 4, 0.92);
+  box-shadow: inset 0 0 18px rgba(28, 88, 18, 0.34);
+  overflow: hidden;
+}
+
+.tactical-terminal header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.45rem 0.6rem;
+  border-bottom: 1px solid rgba(126, 166, 93, 0.25);
+}
+
+.tactical-terminal h3 {
+  margin: 0;
+  font-size: 0.72rem;
+  color: #ccf59a;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+}
+
+.tactical-terminal p {
+  margin: 0;
+  font-size: 0.72rem;
+  color: #8fba77;
+}
+
+.tactical-stream {
+  margin: 0;
+  min-height: 130px;
+  max-height: 200px;
+  overflow: auto;
+  padding: 0.62rem;
+  color: #9de87b;
+  font-size: 0.76rem;
+  line-height: 1.42;
+  letter-spacing: 0.03em;
+  font-family: "JetBrains Mono", "Consolas", monospace;
+  background:
+    linear-gradient(180deg, rgba(9, 26, 6, 0.7), rgba(4, 10, 3, 0.95)),
+    repeating-linear-gradient(0deg, rgba(94, 129, 58, 0.07) 0, rgba(94, 129, 58, 0.07) 1px, transparent 1px, transparent 4px);
+}
+
 .control-panel {
   display: flex;
   flex-direction: column;
@@ -299,6 +346,33 @@ body {
 .btn:disabled {
   opacity: 0.55;
   cursor: not-allowed;
+}
+
+.btn.active-state {
+  border-color: rgba(95, 224, 105, 0.95);
+  color: #d5ffca;
+  box-shadow: 0 0 14px rgba(95, 224, 105, 0.3);
+  background: rgba(15, 42, 14, 0.88);
+}
+
+.btn.inactive-state {
+  border-color: rgba(175, 88, 88, 0.72);
+  color: #ffdbdb;
+  background: rgba(39, 17, 17, 0.88);
+}
+
+.btn.pressed-state {
+  transform: translateY(1px);
+  filter: brightness(1.1);
+}
+
+.lock-select.active-state {
+  border-color: rgba(95, 224, 105, 0.9);
+  box-shadow: 0 0 8px rgba(95, 224, 105, 0.18);
+}
+
+.lock-select.pressed-state {
+  filter: brightness(1.08);
 }
 
 .kbd-hint {
