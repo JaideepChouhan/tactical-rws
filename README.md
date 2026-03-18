@@ -1,218 +1,239 @@
-# AIR0214 Remote Weapon Control Platform
+# AIR0214 Smart RWS Platform
 
-A secure remote control software stack for pan/tilt/trigger systems with a dual-layer web architecture (Flask UI + FastAPI API), role-based access control, persistent audit trails, startup diagnostics, and optical stabilization support.
+Remote Weapon Station control stack with:
+- secure dual-role API access,
+- OpenCV-powered AI target lock,
+- live web command console,
+- persistent command audit trail,
+- startup diagnostics and self-test automation.
 
-## 1. Core Capabilities
+---
 
-- Role-based authorization with operator and observer roles.
-- Endpoint-level permission enforcement.
-- API rate limiting per client IP.
-- Persistent audit logging for fire and movement command paths.
-- Live camera stream in a responsive control console.
-- 2D joystick control via pointer and keyboard (WASD or arrow keys).
-- Live keyboard sensitivity slider with local persistence.
-- Startup self-test page for camera, serial, and command-path diagnostics.
-- NCC visual stabilizer mode for target-lock compensation.
+## System Snapshot
 
-## 2. Architecture
+| Area | What it does |
+|---|---|
+| Live Ops UI | Real-time camera feed, joystick aiming, keyboard control, fire/center commands |
+| AI Assist | Face lock and centered object lock modes using OpenCV |
+| API Security | RBAC, per-route enforcement, rate limiting, request hardening |
+| Reliability | Idempotent fire handling, cooldown guard, response-time/request-id tracing |
+| Traceability | SQLite audit logs for movement, fire, and lock-control events |
 
-- gun_controller.py
-  - Serial communication, smoothing loop, clamping, trigger sequence, movement self-test.
+---
 
-- web_control_server.py
-  - FastAPI endpoints, RBAC middleware, rate limiting, command routing, Flask mounting.
+## Visual Architecture
 
-- audit_logger.py
-  - SQLite-backed durable audit records.
-  - Bounded retention to avoid unbounded disk growth.
+```mermaid
+flowchart LR
+    A[Web Browser Console\nindex.html + app.js] -->|REST + API Key| B[FastAPI Core\nweb_control_server.py]
+    A -->|MJPEG Stream| C[Flask /video_feed]
+    C --> D[CameraStream\nOpenCV Capture]
+    D --> E[TargetLockManager\nFace/Object Detection + Control Loop]
+    E --> B
+    B --> F[GunController\nPan Tilt Trigger]
+    F --> G[Arduino Servo Firmware\ntripod_control.ino]
+    B --> H[AuditLogger\nSQLite audit_logs.db]
+```
 
-- templates/index.html + static/app.js + static/styles.css
-  - Main royal-themed operator console with keyboard sensitivity controls.
+---
 
-- templates/self_test.html + static/self_test.js
-  - Automated diagnostic dashboard.
+## New AI Features Added
 
-- cursor_controller.py
-  - Desktop fallback terminal and mouse control modes.
+### 1) AI Target Lock (OpenCV)
 
-- visual_stabilizer.py
-  - OpenCV NCC-based stabilization mode.
+Two tracking modes are now integrated directly into the server and web UI:
 
-- tripod_control/tripod_control.ino
-  - Arduino serial parser and servo command output.
+- Face mode
+  - Uses Haar cascade frontal-face detection.
+  - Picks the strongest candidate near frame center.
 
-## 3. Access Model and Permissions
+- Centered object mode
+  - Uses foreground segmentation (MOG2) and contour scoring.
+  - Tracks the dominant moving object nearest the center.
 
-### Roles
+Servo correction behavior:
 
-- operator
-  - Full control and diagnostics.
+- Computes normalized frame error for target center.
+- Applies configurable proportional pan/tilt correction.
+- Uses deadzone and max-step limits to reduce oscillation.
 
-- observer
-  - Telemetry-only role.
+Live stream overlay now shows:
+- center crosshair,
+- detected target bounding box,
+- lock mode and confidence status text.
 
-### Endpoint Permission Matrix
+### 2) Web UI Integration
 
-Public:
+Added operator controls to dashboard:
+
+- mode switch: Face / Centered object,
+- lock enable/disable,
+- live deadzone tuning,
+- pan gain tuning,
+- lock telemetry cards (mode, state, confidence).
+
+### 3) API Hardening and Request Handling Tricks
+
+Added robust request-handling mechanisms:
+
+- Request-ID tracing
+  - Accepts or generates X-Request-ID.
+  - Echoes X-Request-ID and X-Response-Time-Ms in responses.
+
+- Payload guard
+  - Enforces JSON content-type for body-carrying API calls.
+  - Rejects oversized payloads with configurable max bytes.
+
+- Scoped rate limiting
+  - Keys by IP + role + method + path for fairer throttling.
+
+- Fire endpoint safety
+  - Idempotency-Key support to avoid duplicate fire on retries.
+  - Cooldown protection to prevent burst trigger requests.
+
+---
+
+## Project Layout
+
+```text
+audit_logger.py            # Durable SQLite audit trail
+cursor_controller.py       # Desktop fallback controller
+gun_controller.py          # Thread-safe servo command layer
+visual_stabilizer.py       # Standalone NCC stabilizer mode
+web_control_server.py      # FastAPI + Flask + AI target lock integration
+
+templates/index.html       # Main operator dashboard
+static/app.js              # Frontend control + API wiring
+static/styles.css          # Console styling
+
+templates/self_test.html   # Startup diagnostics page
+static/self_test.js        # Self-test logic
+
+tripod_control/            # Arduino firmware
+servo_test/                # Arduino servo test sketch
+```
+
+---
+
+## API Surface
+
+### Public
+
 - GET /api/health
 - GET /api/public-config
 
-Operator and Observer:
-- GET /api/state
+### Observer + Operator
 
-Operator only:
+- GET /api/state
+- GET /api/target-lock/state
+
+### Operator Only
+
 - POST /api/aim
 - POST /api/angles
 - POST /api/center
 - POST /api/fire
 - POST /api/self-test
+- POST /api/target-lock/config
+- POST /api/target-lock/enable
+- POST /api/target-lock/disable
 - GET /api/audit
 
-### HTTP Semantics
+---
 
-- 401 Unauthorized: missing/invalid key on protected route.
-- 403 Forbidden: authenticated but role lacks endpoint permission.
-- 429 Too Many Requests: per-IP rate limit exceeded.
+## Security and Environment
 
-## 4. Security Configuration
+Set keys before launch:
 
-Environment variables:
+```bash
+export RWS_OPERATOR_KEY="replace-with-operator-key"
+export RWS_OBSERVER_KEY="replace-with-observer-key"
+export RWS_RATE_LIMIT_PER_MIN=120
 
-- RWS_OPERATOR_KEY
-  - API key for operator role.
+# optional hardening controls
+export RWS_MAX_API_BODY_BYTES=32768
+export RWS_IDEMPOTENCY_TTL_SECONDS=30
+export RWS_FIRE_COOLDOWN_SECONDS=0.45
+```
 
-- RWS_OBSERVER_KEY
-  - API key for observer role.
+If only one key is used:
 
-- RWS_API_KEY
-  - Legacy fallback key; mapped to operator if RWS_OPERATOR_KEY is not set.
+```bash
+export RWS_API_KEY="legacy-single-key"
+```
 
-- RWS_RATE_LIMIT_PER_MIN
-  - Request limit per minute on protected API routes.
-  - Default: 120
+---
 
-Example secure startup:
+## Quick Start
 
-- export RWS_OPERATOR_KEY="replace-with-operator-key"
-- export RWS_OBSERVER_KEY="replace-with-observer-key"
-- export RWS_RATE_LIMIT_PER_MIN=120
-- python3 web_control_server.py
+### 1) Install
 
-## 5. API Overview
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
-- GET /api/health
-  - Runtime health, auth mode, and camera/controller state.
+### 2) Run Platform
 
-- GET /api/public-config
-  - Public security and role capability metadata.
+```bash
+python3 web_control_server.py
+```
 
-- GET /api/state
-  - Current pan/tilt state, camera status, and resolved role.
+### 3) Open Console
 
-- POST /api/aim
-  - Body: {"x": -1..1, "y": -1..1}
+- Main UI: http://localhost:8000/
+- Diagnostics: http://localhost:8000/self-test
 
-- POST /api/angles
-  - Body: {"pan": 0..180, "tilt": 70..110}
+---
 
-- POST /api/center
+## AI Target Lock Usage
 
-- POST /api/fire
+1. Open main dashboard.
+2. Select lock mode (Face or Centered object).
+3. Adjust deadzone and pan gain sliders.
+4. Click Enable Lock.
+5. Observe lock state and confidence; tune gain/deadzone to minimize overshoot.
 
-- POST /api/self-test
+Recommended tuning baseline:
 
-- GET /api/audit?limit=100
-  - Returns recent command events (max 500).
+- deadzone: 0.05 to 0.08
+- pan gain: 1.8 to 2.8
 
-## 6. Audit Logging
+---
 
-Persistence backend:
-- SQLite file: audit_logs.db
+## Hardware Contract
 
-Logged fields:
-- id
-- ts (unix epoch)
-- role
-- client_ip
-- command
-- payload
-- result
+Serial frame to Arduino:
 
-Retention:
-- Auto-pruned to latest 50,000 records.
+```text
+PAN,TILT,TRIGGER\n
+```
 
-## 7. Web Console Features
-
-Main console URL:
-- http://localhost:8000/
-
-Features:
-- TV-style live video pane.
-- Pointer-based 2D joystick.
-- Keyboard joystick with WASD / arrow keys.
-- Live keyboard sensitivity slider (0.15 to 1.00).
-- API key save/clear (browser local storage).
-- Role-aware control lockout for observer sessions.
-
-Startup diagnostics URL:
-- http://localhost:8000/self-test
-
-Self-test output:
-- Auth mode visibility.
-- Camera readiness and resolution.
-- Serial mode (connected or preview).
-- Movement cycle result.
-- Raw diagnostic JSON output.
-
-## 8. Hardware Contract
-
-Servo pin mapping:
+Servo mapping:
 - Pan: pin 5
 - Tilt: pin 6
 - Trigger: pin 9
 
-Serial payload:
-- PAN,TILT,TRIGGER\n
 Ranges:
-- Pan: 0 to 180
-- Tilt: 70 to 110
-- Trigger: 45 safe, 135 fire
+- Pan: 0..180
+- Tilt: 70..110
+- Trigger safe/fire: 45 / 135
 
-## 9. Installation and Run
+---
 
-### Dependencies
+## Validation Checklist
 
-- python3 -m venv .venv
-- source .venv/bin/activate
-- pip install -r requirements.txt
+- Verify observer cannot call control endpoints.
+- Verify operator can use all control + target lock routes.
+- Verify /api/state includes target_lock block.
+- Verify fire cooldown and idempotency behavior.
+- Verify /api/audit records target lock config events.
+- Verify video feed overlay shows lock status and bounding box.
 
-### Run Web Platform
+---
 
-- python3 web_control_server.py
+## Safety Notice
 
-### Run Desktop Fallback Controller
-
-Terminal mode:
-- python3 cursor_controller.py --mode terminal
-
-Mouse mode:
-- python3 cursor_controller.py --mode mouse
-
-### Run NCC Stabilizer
-
-- python3 visual_stabilizer.py
-
-## 10. Validation Checklist
-
-Before deployment:
-- Verify /api/public-config reports expected auth settings.
-- Validate observer key cannot access control endpoints.
-- Validate operator key can execute control endpoints.
-- Verify /api/audit records fire and movement commands.
-- Run /self-test and confirm camera and serial state output.
-- Confirm UI keyboard sensitivity updates movement response.
-
-## 11. Safety and Compliance
-
-Operate only in lawful, controlled, and approved testing environments.
-Always validate software in preview mode before enabling physical actuation.
+Operate only in legal, controlled, and approved test environments.
+Always validate software behavior in preview mode before enabling physical actuation.

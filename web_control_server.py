@@ -4,14 +4,15 @@ import atexit
 import os
 import threading
 import time
+import uuid
 from collections import deque
-from typing import Deque, Dict, Generator, Optional, Set, Tuple
+from typing import Any, Deque, Dict, Generator, Literal, Optional, Set, Tuple
 
 import cv2
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
 from fastapi.middleware.wsgi import WSGIMiddleware
+from fastapi.responses import JSONResponse
 from flask import Flask, Response, render_template
 from pydantic import BaseModel, Field
 
@@ -24,6 +25,9 @@ CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
 CAMERA_FPS = 30
 JPEG_QUALITY = 85
+MAX_API_BODY_BYTES = int(os.getenv("RWS_MAX_API_BODY_BYTES", "32768"))
+IDEMPOTENCY_TTL_SECONDS = int(os.getenv("RWS_IDEMPOTENCY_TTL_SECONDS", "30"))
+FIRE_COOLDOWN_SECONDS = float(os.getenv("RWS_FIRE_COOLDOWN_SECONDS", "0.45"))
 
 OPERATOR_KEY = os.getenv("RWS_OPERATOR_KEY", "").strip()
 OBSERVER_KEY = os.getenv("RWS_OBSERVER_KEY", "").strip()
@@ -44,6 +48,10 @@ ROLE_POLICIES: Dict[Tuple[str, str], Set[str]] = {
     ("POST", "/api/fire"): {"operator"},
     ("POST", "/api/self-test"): {"operator"},
     ("GET", "/api/audit"): {"operator"},
+    ("GET", "/api/target-lock/state"): {"operator", "observer"},
+    ("POST", "/api/target-lock/config"): {"operator"},
+    ("POST", "/api/target-lock/enable"): {"operator"},
+    ("POST", "/api/target-lock/disable"): {"operator"},
 }
 
 
@@ -67,6 +75,49 @@ class SimpleRateLimiter:
 
             bucket.append(now)
             return True, 0
+
+
+class FireGuard:
+    def __init__(self, cooldown_seconds: float, ttl_seconds: int):
+        self.cooldown_seconds = max(0.1, cooldown_seconds)
+        self.ttl_seconds = max(1, ttl_seconds)
+        self._lock = threading.Lock()
+        self._last_fired_at = 0.0
+        self._cache: Dict[str, Dict[str, Any]] = {}
+
+    def _prune(self):
+        now = time.time()
+        stale = [k for k, v in self._cache.items() if now > v["expires_at"]]
+        for key in stale:
+            del self._cache[key]
+
+    def check_and_get_cached(self, idempotency_key: Optional[str]) -> Optional[Dict[str, Any]]:
+        if not idempotency_key:
+            return None
+        with self._lock:
+            self._prune()
+            cached = self._cache.get(idempotency_key)
+            if not cached:
+                return None
+            return cached.get("payload")
+
+    def store_cached(self, idempotency_key: Optional[str], payload: Dict[str, Any]):
+        if not idempotency_key:
+            return
+        with self._lock:
+            self._prune()
+            self._cache[idempotency_key] = {
+                "payload": payload,
+                "expires_at": time.time() + self.ttl_seconds,
+            }
+
+    def check_cooldown(self) -> bool:
+        with self._lock:
+            now = time.time()
+            if (now - self._last_fired_at) < self.cooldown_seconds:
+                return False
+            self._last_fired_at = now
+            return True
 
 
 class CameraStream:
@@ -136,6 +187,258 @@ class CameraStream:
         }
 
 
+class TargetLockManager:
+    def __init__(self, camera: CameraStream, gun: GunController):
+        self.camera = camera
+        self.gun = gun
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+
+        self.enabled = False
+        self.mode: Literal["face", "object"] = "face"
+        self.deadzone = 0.06
+        self.kp_pan = 2.3
+        self.kp_tilt = 2.0
+        self.max_step = 2.1
+
+        self.locked = False
+        self.confidence = 0.0
+        self.target_center: Optional[Tuple[int, int]] = None
+        self.target_bbox: Optional[Tuple[int, int, int, int]] = None
+        self.last_detection_ts: Optional[float] = None
+        self.missed_frames = 0
+
+        cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+        self.face_cascade = cv2.CascadeClassifier(cascade_path)
+        self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=300, varThreshold=36)
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+    def configure(
+        self,
+        *,
+        enabled: Optional[bool] = None,
+        mode: Optional[Literal["face", "object"]] = None,
+        deadzone: Optional[float] = None,
+        kp_pan: Optional[float] = None,
+        kp_tilt: Optional[float] = None,
+        max_step: Optional[float] = None,
+    ):
+        with self._lock:
+            if enabled is not None:
+                self.enabled = enabled
+                if not enabled:
+                    self.locked = False
+            if mode is not None:
+                self.mode = mode
+                self.locked = False
+            if deadzone is not None:
+                self.deadzone = float(max(0.01, min(deadzone, 0.35)))
+            if kp_pan is not None:
+                self.kp_pan = float(max(0.1, min(kp_pan, 10.0)))
+            if kp_tilt is not None:
+                self.kp_tilt = float(max(0.1, min(kp_tilt, 10.0)))
+            if max_step is not None:
+                self.max_step = float(max(0.2, min(max_step, 10.0)))
+
+    def _detect_face(self, frame: np.ndarray) -> Optional[Tuple[int, int, int, int, float]]:
+        if self.face_cascade.empty():
+            return None
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = self.face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(32, 32))
+        if len(faces) == 0:
+            return None
+
+        h, w = frame.shape[:2]
+        frame_center = (w // 2, h // 2)
+        best = None
+        best_score = -1.0
+        for (x, y, fw, fh) in faces:
+            cx = x + fw // 2
+            cy = y + fh // 2
+            dist = np.hypot(cx - frame_center[0], cy - frame_center[1])
+            area = fw * fh
+            score = area / max(1.0, dist + 1.0)
+            if score > best_score:
+                best_score = score
+                best = (x, y, fw, fh)
+
+        if not best:
+            return None
+
+        x, y, fw, fh = best
+        confidence = min(1.0, max(0.2, (fw * fh) / float(w * h * 0.2)))
+        return int(x), int(y), int(fw), int(fh), float(confidence)
+
+    def _detect_object(self, frame: np.ndarray) -> Optional[Tuple[int, int, int, int, float]]:
+        h, w = frame.shape[:2]
+        fg = self.bg_subtractor.apply(frame)
+        _, mask = cv2.threshold(fg, 215, 255, cv2.THRESH_BINARY)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, np.ones((5, 5), np.uint8))
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+
+        frame_center = (w // 2, h // 2)
+        best = None
+        best_score = -1.0
+        min_area = (w * h) * 0.002
+
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < min_area:
+                continue
+            x, y, bw, bh = cv2.boundingRect(contour)
+            cx = x + bw // 2
+            cy = y + bh // 2
+            dist = np.hypot(cx - frame_center[0], cy - frame_center[1])
+            score = area / max(1.0, dist + 1.0)
+            if score > best_score:
+                best_score = score
+                best = (
+                    int(x),
+                    int(y),
+                    int(bw),
+                    int(bh),
+                    float(min(1.0, area / float(w * h * 0.22))),
+                )
+
+        return best
+
+    def _detect_target(self, frame: np.ndarray) -> Optional[Tuple[int, int, int, int, float]]:
+        if self.mode == "face":
+            return self._detect_face(frame)
+        return self._detect_object(frame)
+
+    def _loop(self):
+        while self._running:
+            frame = self.camera.get_frame()
+            if frame is None:
+                time.sleep(0.05)
+                continue
+
+            detection = self._detect_target(frame)
+            h, w = frame.shape[:2]
+            center_x = w // 2
+            center_y = h // 2
+
+            with self._lock:
+                if detection is None:
+                    self.missed_frames += 1
+                    if self.missed_frames > 6:
+                        self.locked = False
+                        self.target_bbox = None
+                        self.target_center = None
+                        self.confidence = 0.0
+                    should_continue = True
+                else:
+                    should_continue = False
+
+                if not should_continue:
+                    self.missed_frames = 0
+                    x, y, bw, bh, confidence = detection
+                    target_x = x + bw // 2
+                    target_y = y + bh // 2
+                    self.target_bbox = (int(x), int(y), int(bw), int(bh))
+                    self.target_center = (int(target_x), int(target_y))
+                    self.confidence = float(confidence)
+                    self.last_detection_ts = time.time()
+
+                    if self.enabled:
+                        err_x = (target_x - center_x) / max(1.0, w / 2.0)
+                        err_y = (target_y - center_y) / max(1.0, h / 2.0)
+
+                        if abs(err_x) < self.deadzone:
+                            err_x = 0.0
+                        if abs(err_y) < self.deadzone:
+                            err_y = 0.0
+
+                        pan_step = float(np.clip(err_x * self.kp_pan, -self.max_step, self.max_step))
+                        tilt_step = float(np.clip(-err_y * self.kp_tilt, -self.max_step, self.max_step))
+
+                        state = self.gun.state()
+                        self.gun.set_target_angles(
+                            state["target_pan"] + pan_step,
+                            state["target_tilt"] + tilt_step,
+                        )
+                        self.locked = True
+                    else:
+                        self.locked = False
+
+            if detection is None:
+                time.sleep(0.03)
+                continue
+
+            time.sleep(0.03)
+
+    def state(self) -> Dict[str, Any]:
+        with self._lock:
+            bbox = None
+            center = None
+            if self.target_bbox is not None:
+                bbox = [int(v) for v in self.target_bbox]
+            if self.target_center is not None:
+                center = [int(v) for v in self.target_center]
+            return {
+                "enabled": self.enabled,
+                "mode": self.mode,
+                "locked": self.locked,
+                "confidence": round(self.confidence, 3),
+                "target_center": center,
+                "target_bbox": bbox,
+                "last_detection_ts": self.last_detection_ts,
+                "deadzone": self.deadzone,
+                "kp_pan": self.kp_pan,
+                "kp_tilt": self.kp_tilt,
+                "max_step": self.max_step,
+            }
+
+    def annotate_frame(self, frame: np.ndarray) -> np.ndarray:
+        overlay = frame.copy()
+        h, w = overlay.shape[:2]
+        cx, cy = w // 2, h // 2
+        cv2.line(overlay, (cx - 24, cy), (cx + 24, cy), (0, 250, 0), 2)
+        cv2.line(overlay, (cx, cy - 24), (cx, cy + 24), (0, 250, 0), 2)
+
+        with self._lock:
+            enabled = self.enabled
+            mode = self.mode
+            locked = self.locked
+            confidence = self.confidence
+            bbox = self.target_bbox
+
+        if bbox is not None:
+            x, y, bw, bh = bbox
+            color = (22, 217, 245) if locked and enabled else (0, 145, 255)
+            cv2.rectangle(overlay, (x, y), (x + bw, y + bh), color, 2)
+
+        status = f"AI LOCK {'ON' if enabled else 'OFF'} | MODE {mode.upper()} | CONF {confidence:.2f}"
+        status_color = (22, 217, 245) if enabled else (125, 125, 125)
+        cv2.putText(
+            overlay,
+            status,
+            (18, 36),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            status_color,
+            2,
+        )
+        return overlay
+
+
 class JoystickCommand(BaseModel):
     x: float = Field(..., ge=-1.0, le=1.0)
     y: float = Field(..., ge=-1.0, le=1.0)
@@ -146,10 +449,21 @@ class AngleCommand(BaseModel):
     tilt: float = Field(..., ge=0.0, le=180.0)
 
 
+class TargetLockConfigCommand(BaseModel):
+    enabled: Optional[bool] = None
+    mode: Optional[Literal["face", "object"]] = None
+    deadzone: Optional[float] = Field(default=None, ge=0.01, le=0.35)
+    kp_pan: Optional[float] = Field(default=None, ge=0.1, le=10.0)
+    kp_tilt: Optional[float] = Field(default=None, ge=0.1, le=10.0)
+    max_step: Optional[float] = Field(default=None, ge=0.2, le=10.0)
+
+
 controller = GunController(GunConfig())
 camera_stream = CameraStream(CAMERA_INDEX)
 rate_limiter = SimpleRateLimiter(RATE_LIMIT_PER_MIN)
 audit_logger = AuditLogger("audit_logs.db")
+target_lock = TargetLockManager(camera_stream, controller)
+fire_guard = FireGuard(FIRE_COOLDOWN_SECONDS, IDEMPOTENCY_TTL_SECONDS)
 
 
 flask_app = Flask(__name__, template_folder="templates", static_folder="static")
@@ -183,6 +497,8 @@ def video_feed():
                 )
                 frame = waiting
 
+            frame = target_lock.annotate_frame(frame)
+
             success, encoded = cv2.imencode(
                 ".jpg",
                 frame,
@@ -192,16 +508,13 @@ def video_feed():
                 continue
 
             jpg = encoded.tobytes()
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
-            )
+            yield b"--frame\r\n" b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
             time.sleep(1.0 / max(CAMERA_FPS, 1))
 
     return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
-api = FastAPI(title="Gun Control API", version="1.0.0")
+api = FastAPI(title="Gun Control API", version="1.1.0")
 
 
 def _client_ip(request: Request) -> str:
@@ -229,6 +542,41 @@ def _request_role(request: Request) -> str:
 
 
 @api.middleware("http")
+async def request_context_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    request.state.request_id = request_id
+    started = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Response-Time-Ms"] = f"{elapsed_ms:.2f}"
+    return response
+
+
+@api.middleware("http")
+async def payload_guard_middleware(request: Request, call_next):
+    if request.url.path.startswith("/api") and request.method.upper() in {"POST", "PUT", "PATCH"}:
+        content_length_raw = request.headers.get("content-length", "0")
+        try:
+            content_length = int(content_length_raw)
+        except ValueError:
+            return JSONResponse(status_code=400, content={"detail": "Invalid Content-Length header"})
+
+        if content_length > MAX_API_BODY_BYTES:
+            return JSONResponse(
+                status_code=413,
+                content={"detail": f"Payload too large. Limit is {MAX_API_BODY_BYTES} bytes."},
+            )
+
+        if content_length > 0:
+            content_type = request.headers.get("content-type", "")
+            if "application/json" not in content_type:
+                return JSONResponse(status_code=415, content={"detail": "Content-Type must be application/json"})
+
+    return await call_next(request)
+
+
+@api.middleware("http")
 async def security_middleware(request: Request, call_next):
     path = request.url.path
     if not path.startswith("/api"):
@@ -243,12 +591,13 @@ async def security_middleware(request: Request, call_next):
         if resolved:
             request.state.role = resolved
     elif supplied_key:
-        # If auth disabled but key was supplied, treat as operator for convenience.
         request.state.role = "operator"
 
     if path not in public_paths:
         client_ip = _client_ip(request)
-        allowed, retry_after = rate_limiter.check(client_ip)
+        role = request.state.role
+        limiter_key = f"{client_ip}:{role}:{request.method.upper()}:{path}"
+        allowed, retry_after = rate_limiter.check(limiter_key)
         if not allowed:
             return JSONResponse(
                 status_code=429,
@@ -275,10 +624,12 @@ def on_startup():
     controller.connect()
     controller.start()
     camera_stream.start()
+    target_lock.start()
 
 
 @api.on_event("shutdown")
 def on_shutdown():
+    target_lock.stop()
     camera_stream.stop()
     controller.stop()
 
@@ -289,12 +640,14 @@ def health():
         "ok": True,
         "auth_required": AUTH_REQUIRED,
         "rate_limit_per_min": RATE_LIMIT_PER_MIN,
+        "max_api_body_bytes": MAX_API_BODY_BYTES,
         "roles_enabled": {
             "operator": bool(OPERATOR_KEY),
             "observer": bool(OBSERVER_KEY),
         },
         "controller": controller.state(),
         "camera": camera_stream.state(),
+        "target_lock": target_lock.state(),
     }
 
 
@@ -303,10 +656,14 @@ def public_config():
     return {
         "auth_required": AUTH_REQUIRED,
         "rate_limit_per_min": RATE_LIMIT_PER_MIN,
+        "max_api_body_bytes": MAX_API_BODY_BYTES,
+        "idempotency_ttl_seconds": IDEMPOTENCY_TTL_SECONDS,
+        "fire_cooldown_seconds": FIRE_COOLDOWN_SECONDS,
         "roles": {
             "operator_enabled": bool(OPERATOR_KEY),
             "observer_enabled": bool(OBSERVER_KEY),
         },
+        "target_lock_modes": ["face", "object"],
     }
 
 
@@ -315,6 +672,7 @@ def state(request: Request):
     _require_roles(request, {"operator", "observer"})
     state_payload = controller.state()
     state_payload["camera"] = camera_stream.state()
+    state_payload["target_lock"] = target_lock.state()
     state_payload["role"] = _request_role(request)
     return state_payload
 
@@ -356,15 +714,27 @@ def set_angles(command: AngleCommand, request: Request):
 @api.post("/api/fire")
 def fire(request: Request):
     _require_roles(request, {"operator"})
+
+    idempotency_key = request.headers.get("Idempotency-Key", "").strip() or None
+    cached = fire_guard.check_and_get_cached(idempotency_key)
+    if cached is not None:
+        return cached
+
+    if not fire_guard.check_cooldown():
+        raise HTTPException(status_code=429, detail="Fire cooldown active. Retry shortly.")
+
     controller.fire()
+    response_payload = controller.state()
+
+    fire_guard.store_cached(idempotency_key, response_payload)
     audit_logger.log_event(
         role=_request_role(request),
         client_ip=_client_ip(request),
         command="fire",
-        payload={},
+        payload={"idempotency_key": bool(idempotency_key)},
         result="ok",
     )
-    return controller.state()
+    return response_payload
 
 
 @api.post("/api/center")
@@ -386,6 +756,7 @@ def self_test(request: Request):
     _require_roles(request, {"operator"})
     result = controller.self_test()
     result["camera"] = camera_stream.state()
+    result["target_lock"] = target_lock.state()
     result["timestamp"] = time.time()
     audit_logger.log_event(
         role=_request_role(request),
@@ -395,6 +766,74 @@ def self_test(request: Request):
         result="ok" if result.get("ok") else "check",
     )
     return result
+
+
+@api.get("/api/target-lock/state")
+def target_lock_state(request: Request):
+    _require_roles(request, {"operator", "observer"})
+    return {
+        "role": _request_role(request),
+        "target_lock": target_lock.state(),
+    }
+
+
+@api.post("/api/target-lock/config")
+def target_lock_config(command: TargetLockConfigCommand, request: Request):
+    _require_roles(request, {"operator"})
+    target_lock.configure(
+        enabled=command.enabled,
+        mode=command.mode,
+        deadzone=command.deadzone,
+        kp_pan=command.kp_pan,
+        kp_tilt=command.kp_tilt,
+        max_step=command.max_step,
+    )
+    payload = target_lock.state()
+    audit_logger.log_event(
+        role=_request_role(request),
+        client_ip=_client_ip(request),
+        command="target-lock-config",
+        payload={
+            "enabled": command.enabled,
+            "mode": command.mode,
+            "deadzone": command.deadzone,
+            "kp_pan": command.kp_pan,
+            "kp_tilt": command.kp_tilt,
+            "max_step": command.max_step,
+        },
+        result="ok",
+    )
+    return payload
+
+
+@api.post("/api/target-lock/enable")
+def target_lock_enable(request: Request):
+    _require_roles(request, {"operator"})
+    target_lock.configure(enabled=True)
+    payload = target_lock.state()
+    audit_logger.log_event(
+        role=_request_role(request),
+        client_ip=_client_ip(request),
+        command="target-lock-enable",
+        payload={},
+        result="ok",
+    )
+    return payload
+
+
+@api.post("/api/target-lock/disable")
+def target_lock_disable(request: Request):
+    _require_roles(request, {"operator"})
+    target_lock.configure(enabled=False)
+    payload = target_lock.state()
+    audit_logger.log_event(
+        role=_request_role(request),
+        client_ip=_client_ip(request),
+        command="target-lock-disable",
+        payload={},
+        result="ok",
+    )
+    return payload
 
 
 @api.get("/api/audit")
@@ -410,6 +849,7 @@ api.mount("/", WSGIMiddleware(flask_app))
 
 
 def _cleanup():
+    target_lock.stop()
     camera_stream.stop()
     controller.stop()
 

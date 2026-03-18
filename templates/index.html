@@ -54,6 +54,36 @@
         <p id="kbSensitivityValue" class="sensitivity-value">0.60</p>
       </div>
 
+      <div class="target-lock-box">
+        <h3>AI Target Lock</h3>
+        <p class="target-lock-subtitle">OpenCV assisted lock on faces or dominant centered object.</p>
+
+        <div class="target-lock-row">
+          <label for="lockMode">Mode</label>
+          <select id="lockMode" class="lock-select">
+            <option value="face">Face</option>
+            <option value="object">Centered object</option>
+          </select>
+        </div>
+
+        <div class="target-lock-row">
+          <label for="lockDeadzone">Deadzone</label>
+          <input id="lockDeadzone" type="range" min="0.01" max="0.20" step="0.01" value="0.06" />
+          <span id="lockDeadzoneValue">0.06</span>
+        </div>
+
+        <div class="target-lock-row">
+          <label for="lockGain">Pan gain</label>
+          <input id="lockGain" type="range" min="0.5" max="5.0" step="0.1" value="2.3" />
+          <span id="lockGainValue">2.3</span>
+        </div>
+
+        <div class="actions target-lock-actions">
+          <button id="lockEnableBtn" class="btn secondary" type="button">Enable Lock</button>
+          <button id="lockDisableBtn" class="btn" type="button">Disable Lock</button>
+        </div>
+      </div>
+
       <div class="status-grid">
         <article>
           <h3>Connection</h3>
@@ -74,6 +104,18 @@
         <article>
           <h3>Role</h3>
           <p id="roleStatus">Unknown</p>
+        </article>
+        <article>
+          <h3>Lock Mode</h3>
+          <p id="lockModeStatus">Face</p>
+        </article>
+        <article>
+          <h3>Lock State</h3>
+          <p id="lockStateStatus">Disabled</p>
+        </article>
+        <article>
+          <h3>Lock Confidence</h3>
+          <p id="lockConfidenceStatus">0.00</p>
         </article>
       </div>
     </section>
