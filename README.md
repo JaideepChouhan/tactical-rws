@@ -51,13 +51,17 @@ Key capabilities:
   - `MANUAL`: full D-pad pan/tilt control + trigger pulse
   - `PATROL`: automatic left-right pan sweep + manual tilt + trigger
   - `SENTRY`: center-lock behavior with trigger active and optional pan micro-corrections
+- Smooth continuous motion model for local buttons:
+  - movement is time-based (continuous while held), not jump-to-endpoint
+  - supports simultaneous two-button diagonals (LEFT+UP, RIGHT+DOWN, etc.)
+  - diagonal speed is normalized for consistent control feel
 - Trigger pulse handling in firmware:
   - controlled fire-hold duration, auto-return to safe trigger angle
 - Serial compatibility with existing host packet format:
   - continues to accept `PAN,TILT,TRIGGER\n` from laptop/server
   - host commands take priority immediately when packets are present
   - automatic fallback to local button control after serial idle timeout
-- Built-in debounce and hold-repeat logic for smoother local control input.
+- Built-in debounce with low-latency continuous movement ticks for responsive local control.
 
 This enables reliable standalone operation while preserving compatibility with the existing web/server control pipeline.
 
@@ -306,7 +310,9 @@ No external pull-up resistors are required.
 Press MODE to cycle:
 
 - `MANUAL`
-  - D-pad controls pan/tilt directly.
+  - Hold any direction button for smooth continuous motion.
+  - Press two direction buttons together for diagonal motion:
+    - LEFT+UP, LEFT+DOWN, RIGHT+UP, RIGHT+DOWN
   - TRIGGER fires a pulse and then returns to safe angle.
 - `PATROL`
   - Pan sweeps left-right automatically.
@@ -315,7 +321,17 @@ Press MODE to cycle:
 - `SENTRY`
   - Pan/tilt snap to center on entry.
   - TRIGGER remains active.
-  - LEFT/RIGHT allow small pan corrections.
+  - LEFT/RIGHT allow smooth low-speed pan corrections.
+
+### 7) Standalone motion tuning (optional)
+
+If you want slower/faster or more realistic button response, tune these constants in `tripod_control_standalone/tripod_control_standalone.ino`:
+
+- `MOVEMENT_TICK_MS` (update period, default ~60 Hz)
+- `PAN_SPEED_DPS` (pan speed in degrees/second)
+- `TILT_SPEED_DPS` (tilt speed in degrees/second)
+- `DIAGONAL_SCALE` (diagonal normalization factor)
+- `SENTRY_PAN_DPS` (micro-correction speed in SENTRY)
 
 ### 5) Understand serial handover
 
