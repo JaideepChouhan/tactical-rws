@@ -51,15 +51,16 @@ const uint8_t BTN_PINS[BTN_COUNT] = {
 
 // ── Timing constants ───────────────────────────────────────────────────────────
 constexpr unsigned long DEBOUNCE_MS       = 25;   // debounce window
-constexpr unsigned long HOLD_DELAY_MS     = 300;  // pause before repeat fires
-constexpr unsigned long REPEAT_INTERVAL_MS = 60;  // repeat rate while held
+constexpr unsigned long MOVEMENT_TICK_MS  = 16;   // ~60Hz movement update
 constexpr unsigned long SERIAL_TIMEOUT_MS = 500;  // serial idle → button mode
 constexpr unsigned long PATROL_STEP_MS    = 30;   // patrol sweep tick
 constexpr unsigned long FIRE_HOLD_MS      = 250;  // how long trigger stays pulled
 
-// ── Movement step sizes ────────────────────────────────────────────────────────
-constexpr int PAN_STEP  = 2;   // degrees per tick
-constexpr int TILT_STEP = 1;
+// ── Movement speeds (degrees/second) ──────────────────────────────────────────
+constexpr float PAN_SPEED_DPS      = 55.0f;
+constexpr float TILT_SPEED_DPS     = 35.0f;
+constexpr float SENTRY_PAN_DPS     = 22.0f;
+constexpr float DIAGONAL_SCALE     = 0.7071f;  // keep diagonal speed balanced
 
 // ── Mode definitions ───────────────────────────────────────────────────────────
 enum Mode : uint8_t {
@@ -81,9 +82,6 @@ Mode currentMode = MODE_MANUAL;
 bool     btnState[BTN_COUNT];        // current debounced state (true = pressed)
 bool     btnRaw[BTN_COUNT];          // raw read last loop
 unsigned long btnLastChange[BTN_COUNT];  // millis of last raw edge
-unsigned long btnHoldStart[BTN_COUNT];   // millis when debounced press began
-bool     btnHoldFired[BTN_COUNT];    // has hold-repeat started?
-unsigned long btnLastRepeat[BTN_COUNT];  // millis of last repeat tick
 
 // Serial
 String        serialBuf      = "";
@@ -97,6 +95,12 @@ unsigned long triggerFireMs  = 0;
 // Patrol state
 int           patrolDir      = 1;          // +1 right, -1 left
 unsigned long patrolLastMs   = 0;
+
+// Smooth movement state
+unsigned long lastMoveMs     = 0;
+float         panResidualDeg = 0.0f;
+float         tiltResidualDeg = 0.0f;
+float         sentryResidualDeg = 0.0f;
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -125,31 +129,15 @@ void reportMode() {
   Serial.println(MODE_NAMES[currentMode]);
 }
 
-// ── Button helpers ─────────────────────────────────────────────────────────────
+// ── Movement helpers ───────────────────────────────────────────────────────────
 
-// Returns true on the first pressed edge (debounced)
-bool justPressed(uint8_t idx) {
-  return btnState[idx] && !btnHoldFired[idx] &&
-         (millis() - btnHoldStart[idx] < HOLD_DELAY_MS) &&
-         (millis() - btnHoldStart[idx] >= DEBOUNCE_MS);
-}
-
-// Returns true every REPEAT_INTERVAL_MS while button is held (after HOLD_DELAY_MS)
-bool heldRepeat(uint8_t idx) {
-  if (!btnState[idx]) return false;
-  unsigned long now = millis();
-  unsigned long heldFor = now - btnHoldStart[idx];
-  if (heldFor < HOLD_DELAY_MS) return false;
-  if (!btnHoldFired[idx]) {
-    btnHoldFired[idx] = true;
-    btnLastRepeat[idx] = now;
-    return true;  // first repeat tick
+int consumeWholeDegrees(float& accumulator) {
+  int whole = 0;
+  if (accumulator >= 1.0f || accumulator <= -1.0f) {
+    whole = (int)accumulator;  // truncates toward zero, keeps signed direction
+    accumulator -= whole;
   }
-  if (now - btnLastRepeat[idx] >= REPEAT_INTERVAL_MS) {
-    btnLastRepeat[idx] = now;
-    return true;
-  }
-  return false;
+  return whole;
 }
 
 // ── Setup ──────────────────────────────────────────────────────────────────────
@@ -170,10 +158,9 @@ void setup() {
     btnState[i]      = false;
     btnRaw[i]        = true;   // HIGH = not pressed with pull-up
     btnLastChange[i] = 0;
-    btnHoldStart[i]  = 0;
-    btnHoldFired[i]  = false;
-    btnLastRepeat[i] = 0;
   }
+
+  lastMoveMs = millis();
 
   Serial.println(F("AIR0214 STANDALONE READY"));
   reportMode();
@@ -223,8 +210,6 @@ void updateButtons() {
       if (raw && !btnState[i]) {
         // Freshly pressed
         btnState[i]      = true;
-        btnHoldStart[i]  = now;
-        btnHoldFired[i]  = false;
       } else if (!raw && btnState[i]) {
         // Released
         btnState[i] = false;
@@ -280,30 +265,35 @@ void handleTriggerButton() {
 // ── D-pad movement (MANUAL mode) ──────────────────────────────────────────────
 
 void handleDpad() {
-  bool moved = false;
+  unsigned long now = millis();
+  unsigned long dtMs = now - lastMoveMs;
+  if (dtMs < MOVEMENT_TICK_MS) return;
+  lastMoveMs = now;
 
-  // UP  → tilt up (decrease angle toward TILT_MIN)
-  if (justPressed(IDX_UP) || heldRepeat(IDX_UP)) {
-    currentTilt = constrain(currentTilt - TILT_STEP, TILT_MIN, TILT_MAX);
-    moved = true;
-  }
-  // DOWN → tilt down (increase angle toward TILT_MAX)
-  if (justPressed(IDX_DOWN) || heldRepeat(IDX_DOWN)) {
-    currentTilt = constrain(currentTilt + TILT_STEP, TILT_MIN, TILT_MAX);
-    moved = true;
-  }
-  // LEFT  → pan left (decrease pan angle)
-  if (justPressed(IDX_LEFT) || heldRepeat(IDX_LEFT)) {
-    currentPan = constrain(currentPan - PAN_STEP, PAN_MIN, PAN_MAX);
-    moved = true;
-  }
-  // RIGHT → pan right (increase pan angle)
-  if (justPressed(IDX_RIGHT) || heldRepeat(IDX_RIGHT)) {
-    currentPan = constrain(currentPan + PAN_STEP, PAN_MIN, PAN_MAX);
-    moved = true;
+  int panDir = (btnState[IDX_RIGHT] ? 1 : 0) - (btnState[IDX_LEFT] ? 1 : 0);
+  int tiltDir = (btnState[IDX_DOWN] ? 1 : 0) - (btnState[IDX_UP] ? 1 : 0);
+
+  if (panDir == 0 && tiltDir == 0) {
+    return;
   }
 
-  if (moved) applyServos();
+  float speedScale = (panDir != 0 && tiltDir != 0) ? DIAGONAL_SCALE : 1.0f;
+  float dtSec = dtMs / 1000.0f;
+
+  panResidualDeg += panDir * PAN_SPEED_DPS * speedScale * dtSec;
+  tiltResidualDeg += tiltDir * TILT_SPEED_DPS * speedScale * dtSec;
+
+  int panStep = consumeWholeDegrees(panResidualDeg);
+  int tiltStep = consumeWholeDegrees(tiltResidualDeg);
+  if (panStep == 0 && tiltStep == 0) return;
+
+  int newPan = constrain(currentPan + panStep, PAN_MIN, PAN_MAX);
+  int newTilt = constrain(currentTilt + tiltStep, TILT_MIN, TILT_MAX);
+  if (newPan != currentPan || newTilt != currentTilt) {
+    currentPan = newPan;
+    currentTilt = newTilt;
+    applyServos();
+  }
 }
 
 // ── Patrol sweep (PATROL mode) ────────────────────────────────────────────────
@@ -312,16 +302,30 @@ void handlePatrol() {
   unsigned long now = millis();
   if (now - patrolLastMs >= PATROL_STEP_MS) {
     patrolLastMs = now;
-    currentPan  += patrolDir * PAN_STEP;
+    currentPan  += patrolDir;
     if (currentPan >= PAN_MAX) { currentPan = PAN_MAX; patrolDir = -1; }
     if (currentPan <= PAN_MIN) { currentPan = PAN_MIN; patrolDir =  1; }
     servoPan.write(currentPan);
   }
-  // Tilt is still manually adjustable in patrol mode
-  bool moved = false;
-  if (justPressed(IDX_UP)   || heldRepeat(IDX_UP))   { currentTilt = constrain(currentTilt - TILT_STEP, TILT_MIN, TILT_MAX); moved = true; }
-  if (justPressed(IDX_DOWN) || heldRepeat(IDX_DOWN))  { currentTilt = constrain(currentTilt + TILT_STEP, TILT_MIN, TILT_MAX); moved = true; }
-  if (moved) servoTilt.write(currentTilt);
+
+  // Tilt remains smooth manual while pan patrols.
+  unsigned long dtMs = now - lastMoveMs;
+  if (dtMs >= MOVEMENT_TICK_MS) {
+    lastMoveMs = now;
+    int tiltDir = (btnState[IDX_DOWN] ? 1 : 0) - (btnState[IDX_UP] ? 1 : 0);
+    if (tiltDir != 0) {
+      float dtSec = dtMs / 1000.0f;
+      tiltResidualDeg += tiltDir * TILT_SPEED_DPS * dtSec;
+      int tiltStep = consumeWholeDegrees(tiltResidualDeg);
+      if (tiltStep != 0) {
+        int newTilt = constrain(currentTilt + tiltStep, TILT_MIN, TILT_MAX);
+        if (newTilt != currentTilt) {
+          currentTilt = newTilt;
+          servoTilt.write(currentTilt);
+        }
+      }
+    }
+  }
 }
 
 // ── Main loop ──────────────────────────────────────────────────────────────────
@@ -348,8 +352,26 @@ void loop() {
     case MODE_SENTRY:
       // Servos are already centred; only trigger is active.
       // Left/Right can still nudge pan for micro-corrections.
-      if (justPressed(IDX_LEFT)  || heldRepeat(IDX_LEFT))  { currentPan = constrain(currentPan - PAN_STEP, PAN_MIN, PAN_MAX); servoPan.write(currentPan); }
-      if (justPressed(IDX_RIGHT) || heldRepeat(IDX_RIGHT))  { currentPan = constrain(currentPan + PAN_STEP, PAN_MIN, PAN_MAX); servoPan.write(currentPan); }
+      {
+        unsigned long now = millis();
+        unsigned long dtMs = now - lastMoveMs;
+        if (dtMs >= MOVEMENT_TICK_MS) {
+          lastMoveMs = now;
+          int panDir = (btnState[IDX_RIGHT] ? 1 : 0) - (btnState[IDX_LEFT] ? 1 : 0);
+          if (panDir != 0) {
+            float dtSec = dtMs / 1000.0f;
+            sentryResidualDeg += panDir * SENTRY_PAN_DPS * dtSec;
+            int panStep = consumeWholeDegrees(sentryResidualDeg);
+            if (panStep != 0) {
+              int newPan = constrain(currentPan + panStep, PAN_MIN, PAN_MAX);
+              if (newPan != currentPan) {
+                currentPan = newPan;
+                servoPan.write(currentPan);
+              }
+            }
+          }
+        }
+      }
       break;
   }
 }
