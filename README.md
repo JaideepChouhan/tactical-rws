@@ -39,6 +39,28 @@ flowchart LR
 
 ## New AI Features Added
 
+### Standalone Tripod Firmware (New)
+
+Added a dedicated standalone Arduino firmware in `tripod_control_standalone/tripod_control_standalone.ino` for field use without requiring continuous host control.
+
+Key capabilities:
+
+- 6-button direct control using internal pull-ups (no external resistors required):
+  - UP, DOWN, LEFT, RIGHT, TRIGGER, MODE
+- Three operating modes (cycled by MODE button):
+  - `MANUAL`: full D-pad pan/tilt control + trigger pulse
+  - `PATROL`: automatic left-right pan sweep + manual tilt + trigger
+  - `SENTRY`: center-lock behavior with trigger active and optional pan micro-corrections
+- Trigger pulse handling in firmware:
+  - controlled fire-hold duration, auto-return to safe trigger angle
+- Serial compatibility with existing host packet format:
+  - continues to accept `PAN,TILT,TRIGGER\n` from laptop/server
+  - host commands take priority immediately when packets are present
+  - automatic fallback to local button control after serial idle timeout
+- Built-in debounce and hold-repeat logic for smoother local control input.
+
+This enables reliable standalone operation while preserving compatibility with the existing web/server control pipeline.
+
 ### 1) AI Target Lock (OpenCV)
 
 Three tracking modes are integrated directly into the server and web UI:
@@ -153,6 +175,7 @@ templates/self_test.html   # Startup diagnostics page
 static/self_test.js        # Self-test logic
 
 tripod_control/            # Arduino firmware
+tripod_control_standalone/ # Arduino standalone 6-button + multi-mode firmware
 servo_test/                # Arduino servo test sketch
 ```
 
@@ -248,6 +271,68 @@ Recommended tuning baseline:
 - pan gain: 1.8 to 2.8
 - auto response: 0.30 to 0.55
 - manual response: 0.25 to 0.55
+
+---
+
+## How To Use Standalone Mode
+
+Use this mode when you want the Arduino to run locally with buttons, with or without a connected laptop.
+
+### 1) Upload firmware
+
+- Flash `tripod_control_standalone/tripod_control_standalone.ino` to the Arduino.
+
+### 2) Wire buttons (INPUT_PULLUP)
+
+- Connect one side of each push-button to the pin, and the other side to GND.
+- Pin map:
+  - UP: D2
+  - DOWN: D3
+  - LEFT: D4
+  - RIGHT: D7
+  - TRIGGER: D8
+  - MODE: D10
+
+No external pull-up resistors are required.
+
+### 3) Servo and trigger pins
+
+- Pan servo: D5
+- Tilt servo: D6
+- Trigger servo: D9
+
+### 4) Use operating modes
+
+Press MODE to cycle:
+
+- `MANUAL`
+  - D-pad controls pan/tilt directly.
+  - TRIGGER fires a pulse and then returns to safe angle.
+- `PATROL`
+  - Pan sweeps left-right automatically.
+  - UP/DOWN still adjust tilt.
+  - TRIGGER remains active.
+- `SENTRY`
+  - Pan/tilt snap to center on entry.
+  - TRIGGER remains active.
+  - LEFT/RIGHT allow small pan corrections.
+
+### 5) Understand serial handover
+
+- The firmware still accepts serial packets in the existing format:
+  - `PAN,TILT,TRIGGER\n`
+- If valid serial packets are arriving, host control takes priority.
+- If serial goes idle for the timeout window, control automatically returns to buttons.
+
+### 6) Verify status on Serial Monitor (optional)
+
+- Open Serial Monitor at `9600` baud.
+- You will see mode and event messages such as:
+  - `MODE:MANUAL`
+  - `MODE:PATROL`
+  - `MODE:SENTRY`
+  - `EVENT:FIRE`
+  - `SERIAL_IDLE:BUTTON_CTRL_ACTIVE`
 
 ---
 
